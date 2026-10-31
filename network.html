@@ -1,0 +1,248 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light dark">
+    <title>TravelPi Network</title>
+    <link rel="stylesheet" href="travelpi.css">
+  </head>
+  <body>
+    <main id="travelpi-app" class="app-shell" aria-busy="false">
+      <header class="app-header">
+        <div class="brand-lockup">
+          <span class="brand-mark" aria-hidden="true">TP</span>
+          <div>
+            <p class="eyebrow">TravelPi Cockpit</p>
+            <h1>Network &amp; shaping</h1>
+          </div>
+        </div>
+        <div class="header-tools">
+          <span class="refresh-meta">Updated <time id="last-updated" datetime="">Not yet</time> <span id="freshness-state" class="muted">(not checked)</span></span>
+          <button id="refresh" class="button button-quiet" type="button">Refresh</button>
+        </div>
+      </header>
+
+      <div class="vitals-strip" aria-label="Vitals">
+        <span id="vitals-internet" class="vital-chip" data-state="neutral">Internet checking&hellip;</span>
+        <span id="vitals-ap" class="vital-chip" data-state="neutral">AP checking&hellip;</span>
+        <span id="vitals-dns" class="vital-chip" data-state="neutral">DNS checking&hellip;</span>
+        <span id="vitals-mem" class="vital-chip" data-state="neutral">Mem checking&hellip;</span>
+        <span id="vitals-power" class="vital-chip" data-state="neutral">Power checking&hellip;</span>
+      </div>
+      <p id="issue-banner" class="issue-banner" data-state="ok">Loading status&hellip;</p>
+
+      <p id="notice" class="notice" role="status" aria-live="polite">Waiting for the first status refresh.</p>
+
+      <details id="pending-bar" class="pending-bar" hidden open aria-labelledby="pending-title" aria-live="polite">
+        <summary class="pending-summary">
+          <span class="pending-copy">
+            <span class="eyebrow" id="pending-title">Pending changes</span>
+            <strong id="pending-summary">None</strong>
+          </span>
+          <span class="summary-meta">Show or hide</span>
+        </summary>
+        <div class="pending-content">
+          <p id="pending-hint" class="pending-hint">Nothing has been applied yet.</p>
+          <ul id="pending-list" class="pending-list"></ul>
+          <div class="button-row">
+            <button id="apply-pending" class="button button-primary" type="button">Apply Changes</button>
+            <button id="rollback-pending" class="button button-secondary" type="button">Rollback Pending</button>
+          </div>
+        </div>
+      </details>
+
+      <section id="quick-settings" class="section-block" aria-labelledby="quick-settings-heading">
+        <article class="wide-card quick-settings-card">
+          <header class="card-header">
+            <div>
+              <p class="eyebrow">Quick Settings</p>
+              <h2 id="quick-settings-heading">Privacy, tunnels addressing and shaping</h2>
+            </div>
+            <span id="quick-settings-chip" class="status-badge status-badge-neutral">Read-only checks</span>
+          </header>
+          <p class="compact-copy">Disruptive changes stay staged; AdGuard Home is the full DNS admin surface.</p>
+          <div class="quick-settings-grid">
+            <article class="quick-setting-card">
+              <div class="quick-setting-heading"><h3>DNS privacy</h3><span id="quick-dns-chip" class="status-badge status-badge-neutral">Unknown</span></div>
+              <strong id="quick-dns-state">Checking&hellip;</strong>
+              <p id="quick-dns-detail" class="compact-copy">AdGuard Home &rarr; Unbound</p>
+              <div class="button-row mode-row">
+                <button id="dns-mode-adguard" class="button button-secondary" type="button" data-action="set_dns_stack" data-target="adguard">Filtered (AdGuard)</button>
+                <button id="dns-mode-unbound" class="button button-secondary" type="button" data-action="set_dns_stack" data-target="unbound">Recursive (Unbound)</button>
+              </div>
+              <p id="dns-mode-reason" class="control-reason muted" hidden>Filtered mode unavailable: AdGuard Home is not running.</p>
+              <p id="quick-dns-mode-note" class="compact-copy muted">Filtered mode is the default: AdGuard blocks ads and resolves tailnet names; recursive mode is unfiltered.</p>
+              <a id="adguard-link" class="text-link" href="/" target="_blank" rel="noreferrer">Open AdGuard Home <span class="interface-secondary">(port 80)</span></a>
+            </article>
+            <article class="quick-setting-card">
+              <div class="quick-setting-heading"><h3>Unbound</h3><span id="quick-unbound-chip" class="status-badge status-badge-neutral">Unknown</span></div>
+              <strong id="quick-unbound-state">Checking&hellip;</strong>
+              <p id="quick-unbound-detail" class="compact-copy">Recursive resolver on 127.0.0.1:5335</p>
+            </article>
+            <article class="quick-setting-card">
+              <div class="quick-setting-heading"><h3>IPv6</h3><span id="quick-ipv6-chip" class="status-badge status-badge-neutral">Unknown</span></div>
+              <strong id="quick-ipv6-state">Checking&hellip;</strong>
+              <p id="quick-ipv6-detail" class="compact-copy">Off &middot; ULA only &middot; Active — state read from live addresses and router advertisements.</p>
+              <div class="button-row mode-row">
+                <button id="ipv6-on" class="button button-secondary" type="button" data-action="set_ipv6" data-target="on">IPv6 on</button>
+                <button id="ipv6-off" class="button button-secondary" type="button" data-action="set_ipv6" data-target="off">IPv6 off</button>
+              </div>
+              <p id="quick-ipv6-mode-note" class="compact-copy muted">Mode explanation appears once IPv6 state is read.</p>
+              <p class="compact-copy muted">Devices on this router only get a global IPv6 address once a delegated prefix is routed to the AP. That is not implemented yet.</p>
+              <div class="scan-row"><button id="pd-check" class="button button-secondary" type="button">Check prefix delegation</button><span id="pd-check-status" class="action-note" role="status">Asks the hotel or home router whether it would delegate an IPv6 prefix. Takes no lease.</span></div>
+            </article>
+            <article class="quick-setting-card">
+              <div class="quick-setting-heading"><h3>Traffic shaping</h3><span id="quick-sqm-chip" class="status-badge status-badge-neutral">Unknown</span></div>
+              <strong id="quick-sqm-state">Checking&hellip;</strong>
+              <p id="quick-sqm-detail" class="compact-copy">CAKE status and rate are read from the managed service.</p>
+              <p id="quick-sqm-autotune" class="compact-copy">Auto-tune status is reported by the tuning timer.</p>
+              <div class="button-row mode-row">
+                <button id="sqm-mode-auto" class="button button-secondary" type="button" data-action="set_sqm_mode" data-target="auto">Auto</button>
+                <button id="sqm-mode-manual" class="button button-secondary" type="button" data-action="set_sqm_mode" data-target="manual">Manual</button>
+                <button id="sqm-mode-off" class="button button-secondary" type="button" data-action="set_sqm_mode" data-target="off">Off</button>
+              </div>
+              <span id="spark-tune" class="spark" title="download shaper history"></span>
+            </article>
+          </div>
+        </article>
+      </section>
+
+      <details id="network" class="disclosure-block">
+        <summary><span><span class="eyebrow">Network</span><strong>Routing and uplink details</strong></span><span id="network-summary" class="summary-meta">Read-only</span></summary>
+        <div class="disclosure-content">
+          <div class="detail-grid">
+            <article class="detail-card">
+              <h3>Current route</h3>
+              <dl class="compact-list">
+                <div><dt>WAN interface</dt><dd id="network-wan-interface">&mdash;</dd></div>
+                <div><dt>Gateway</dt><dd id="network-wan-gateway">&mdash;</dd></div>
+                <div><dt>DNS</dt><dd id="network-dns">&mdash;</dd></div>
+                <div><dt>Forwarding</dt><dd id="network-forwarding">&mdash;</dd></div>
+              </dl>
+            </article>
+            <article class="detail-card">
+              <h3>Internal management</h3>
+              <dl class="compact-list">
+                <div><dt>Interface</dt><dd>Ethernet <span class="interface-secondary">(eth0)</span></dd></div>
+                <div><dt>Role</dt><dd>Management only</dd></div>
+                <div><dt>Default route</dt><dd>Never</dd></div>
+              </dl>
+            </article>
+            <article class="detail-card">
+              <h3>Wireless detail</h3>
+              <dl class="compact-list">
+                <div><dt>WAN gateway</dt><dd id="detail-wan-gateway">&mdash;</dd></div>
+                <div><dt>WAN frequency</dt><dd id="detail-wan-frequency">&mdash;</dd></div>
+                <div><dt>WAN TX / RX</dt><dd id="detail-wan-rates">&mdash;</dd></div>
+                <div><dt>AP frequency</dt><dd id="detail-ap-frequency">&mdash;</dd></div>
+                <div><dt>AP width</dt><dd id="detail-ap-width">&mdash;</dd></div>
+                <div><dt>AP TX power</dt><dd id="detail-ap-txpower">&mdash;</dd></div>
+              </dl>
+            </article>
+          </div>
+
+          <div class="control-grid compact-controls">
+            <article class="control-card read-only-card">
+              <h3>Default route</h3>
+              <p class="control-help">The helper owns route truth; this page does not run arbitrary network probes.</p>
+              <dl class="compact-list">
+                <div><dt>Gateway</dt><dd id="route-default">&mdash;</dd></div>
+                <div><dt>Device</dt><dd id="route-device">&mdash;</dd></div>
+              </dl>
+            </article>
+          </div>
+        </div>
+      </details>
+
+      <details id="advanced" class="disclosure-block">
+        <summary><span><span class="eyebrow">Advanced</span><strong>Radio and shaping controls</strong></span><span id="advanced-summary" class="summary-meta">Confirmation required</span></summary>
+        <div class="disclosure-content">
+          <div class="control-grid">
+            <form id="ap-form" class="control-card" data-confirmation="required">
+              <fieldset>
+                <legend>TravelPi Wi-Fi (AP) radio profile</legend>
+                <p id="ap-profile-help" class="control-help">Choose the allowlisted profile for <span class="interface-secondary">wlan1</span>. The setting is staged until Apply Changes.</p>
+                <div class="radio-group" role="radiogroup" aria-describedby="ap-profile-help">
+                  <label class="radio-option" for="ap-profile-24">
+                    <input id="ap-profile-24" name="ap-profile" type="radio" value="2.4ghz" required>
+                    <span><strong>2.4 GHz</strong><small>Channel 6</small></span>
+                  </label>
+                  <label class="radio-option" for="ap-profile-5">
+                    <input id="ap-profile-5" name="ap-profile" type="radio" value="5ghz" required>
+                    <span><strong>5 GHz / Wi-Fi 6</strong><small>Channel 36</small></span>
+                  </label>
+                  <label class="radio-option" id="ap-profile-6-option" for="ap-profile-6" hidden>
+                    <input id="ap-profile-6" name="ap-profile" type="radio" value="6ghz">
+                    <span><strong>6 GHz / Wi-Fi 6E</strong><small>Auto channel</small></span>
+                  </label>
+                </div>
+                <p id="ap-6ghz-reason" class="control-reason muted">6 GHz is not offered: this radio has not reported 6 GHz channels.</p>
+                <div class="field-group">
+                  <label for="ap-channel-select">Channel</label>
+                  <select id="ap-channel-select" name="ap-channel">
+                    <option value="">Default for band</option>
+                  </select>
+                  <button id="ap-channel-auto" class="button button-secondary" type="button">Auto</button>
+                  <small id="ap-channel-help">Channels are validated against what the AP radio reports; radar (DFS) channels are excluded. Auto uses the band's default channel.</small>
+                </div>
+                <button class="button button-primary" type="submit">Stage AP profile</button>
+              </fieldset>
+            </form>
+
+            <form id="ap-identity-form" class="control-card" data-confirmation="required">
+              <fieldset>
+                <legend>AP name &amp; password</legend>
+                <p id="ap-identity-help" class="control-help">Change the broadcast name and/or WPA password of the TravelPi AP. The new password is never shown back and never stored by the dashboard; WPA2-PSK stays the only mode.</p>
+                <div class="field-group">
+                  <label for="ap-identity-ssid">AP name</label>
+                  <input id="ap-identity-ssid" name="ap-identity-ssid" type="text" maxlength="32" autocomplete="off" spellcheck="false">
+                </div>
+                <div class="field-group">
+                  <label for="ap-identity-pass">New password <span class="muted">(optional)</span></label>
+                  <input id="ap-identity-pass" name="ap-identity-pass" type="password" minlength="8" maxlength="63" autocomplete="new-password" spellcheck="false" placeholder="Leave blank to keep the current password" aria-describedby="ap-identity-help">
+                </div>
+                <button class="button button-primary" type="submit">Stage AP identity</button>
+              </fieldset>
+            </form>
+
+            <form id="cake-form" class="control-card" data-confirmation="required">
+              <fieldset>
+                <legend>CAKE rate</legend>
+                <p id="cake-mode-help" class="control-help">Loading shaping mode&hellip;</p>
+                <div class="field-group">
+                  <label for="cake-rate-input">Rate</label>
+                  <div class="input-with-suffix"><input id="cake-rate-input" name="cake-rate" type="number" min="1" max="1000000" step="1" inputmode="numeric" autocomplete="off" required><span aria-hidden="true">Mbps</span></div>
+                </div>
+                <button id="stage-cake-rate" class="button button-primary" type="submit">Stage CAKE rate</button>
+              </fieldset>
+            </form>
+          </div>
+        </div>
+      </details>
+
+      <p class="card-action-line">
+        <a class="text-link" href="/travelpi/">&larr; Router overview</a>
+        <a class="text-link" href="/travelpi/health">Health &amp; power &rarr;</a>
+      </p>
+
+      <dialog id="confirm-dialog" aria-labelledby="confirm-title" aria-describedby="confirm-message">
+        <div class="dialog-content">
+          <p class="eyebrow">Confirm action</p>
+          <h2 id="confirm-title">Are you sure?</h2>
+          <p id="confirm-message">This action may interrupt the router. Do you want to continue?</p>
+          <div class="dialog-actions">
+            <button id="confirm-cancel" class="button button-secondary" type="button" value="cancel">Cancel</button>
+            <button id="confirm-accept" class="button button-danger" type="button" value="accept">Confirm</button>
+          </div>
+        </div>
+      </dialog>
+    </main>
+
+    <noscript><p class="no-script">TravelPi requires JavaScript to read status from Cockpit.</p></noscript>
+    <script src="../base1/cockpit.js" defer></script>
+    <script src="travelpi-mutations.js" defer></script>
+    <script src="travelpi-typed.js" defer></script>
+    <script src="travelpi.js" defer></script>
+  </body>
+</html>

@@ -1,0 +1,13 @@
+[Unit]
+Description=TravelPi AP radio driver gate (MT7925 vs MT7921, never driverless)
+After=systemd-modules-load.service
+Before=hostapd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=TRAVELPI_RADIO_BOOT=1 TRAVELPI_RADIO_WAIT=20
+ExecStart=/usr/local/libexec/travelpi-radio-driver
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,13 @@
+[Unit]
+Description=TravelPi clock set from HTTPS header when NTP is blocked
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'd=$(curl -fsSI -m 10 https://www.google.com/generate_204 2>/dev/null | grep -i "^date:" | sed "s/^[Dd]ate: *//"); if [ -n "$d" ]; then date -u -s "$d" && echo "clock set from HTTPS: $d"; else echo "no HTTPS date header reachable"; fi'
+SuccessExitStatus=0 1
+TimeoutStartSec=30
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,26 @@
+[Unit]
+Description=AdGuardHome DNS
+After=network-online.target unbound.service travelpi-power-record.service
+Wants=network-online.target unbound.service
+Wants=travelpi-power-record.service
+
+[Container]
+Network=host
+Image=docker.io/adguard/adguardhome:latest
+AutoUpdate=local
+Volume=/opt/adguardhome/work:/opt/adguardhome/work:Z
+Volume=/opt/adguardhome/conf:/opt/adguardhome/conf:Z
+Volume=travelpi-adguard-stats:/opt/adguardhome/work/stats
+Exec=--no-check-update -c /opt/adguardhome/conf/AdGuardHome.yaml -w /opt/adguardhome/work
+Environment=HOME=/opt/adguardhome
+
+[Service]
+Restart=always
+RestartSec=5
+MemoryMax=192M
+TasksMax=128
+TimeoutStartSec=240
+ExecStartPre=/usr/local/libexec/travelpi-power-gate
+
+[Install]
+WantedBy=multi-user.target

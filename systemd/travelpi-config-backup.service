@@ -1,0 +1,6 @@
+[Unit]
+Description=TravelPi config backup snapshot
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/travelpi-config-backup

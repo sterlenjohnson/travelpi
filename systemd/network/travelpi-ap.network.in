@@ -1,0 +1,48 @@
+# TravelPi AP router advertisement TEMPLATE. make deploy renders it with
+# travelpi-ula-init into /etc/systemd/network/070-travelpi-ap.network,
+# substituting the per-install ULA /64 from /etc/travelpi/ula-prefix
+# (@ULA_PREFIX@) and its ::1 gateway (@ULA_GATEWAY@). Never install this
+# file unrendered.
+#
+# 2026-10-30: radvd 2.20's privsep sandbox is broken on this host — the
+# sandboxed sender child resolves NO interface ("wlan1" not found: No such
+# device, and the same for lo), so no RA ever left the AP and clients
+# SLAACed nothing. systemd-networkd v257 advertises the ULA prefix
+# and the NAT64 route without a sandbox; deploy disables radvd.
+#
+# The AP addresses are declared below (Address=) so networkd OWNS them:
+# its configure/flush is then an idempotent replace, and the keeper's
+# heals agree with it. 2026-10-30 oscillation: with no Address= here,
+# networkd's first configure flushed the keeper's addresses (devices
+# lost internet), and the keeper's networkd restart on every v6-missing
+# tick wiped them again every 15s. AcceptRA=no keeps the AP interface
+# from learning routes from its own advertisements. The keeper runs
+# "nmcli device set wlan1 managed no" so NetworkManager hands the link
+# to networkd; after an NM restart the keeper re-unmanages within its
+# 15s loop and networkd re-applies.
+[Match]
+Name=wlan1
+
+[Link]
+RequiredForOnline=no
+
+[Network]
+LinkLocalAddressing=ipv6
+IPv6SendRA=yes
+AcceptRA=no
+Address=192.168.200.1/24 @ULA_GATEWAY@
+MinRtrAdvIntervalSec=30
+MaxRtrAdvIntervalSec=100
+IPv6Prefix=@ULA_PREFIX@
+IPv6RoutePrefix=64:ff9b::/96
+
+[IPv6Prefix]
+Prefix=@ULA_PREFIX@
+OnLink=true
+Autonomous=true
+Managed=false
+OtherInfo=false
+
+[IPv6RoutePrefix]
+Route=64:ff9b::/96
+LifetimeSec=86400

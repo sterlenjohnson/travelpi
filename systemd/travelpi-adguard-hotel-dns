@@ -1,0 +1,80 @@
+#!/bin/sh
+# NetworkManager dispatcher: keep AdGuard Home's internet DNS on the hotel
+# WAN (captive-portal safe — the portal's own resolver answers its probes)
+# while preserving the tailnet split: *.ts.net names resolve through the
+# tunnel (100.100.100.100), and Unbound stays as fallback. Runs as root on
+# dhcp4-change for the WAN interface, and can be run by hand:
+#   DHCP4_NAMESERVERS="172.20.0.1" sh $0 wlan0 dhcp4-change
+set -u
+# Path/command overrides are test seams only: honored solely with TRAVELPI_TEST=1,
+# so a hostile environment can never pick a command or file used as root.
+[ "${TRAVELPI_TEST:-}" = 1 ] || unset ADGUARD_YAML TRAVELPI_HOME_DNS
+# NetworkManager passes "$1 interface, $2 action" to every dispatcher script;
+# only the WAN's DHCPv4 events may rewrite AdGuard's upstreams (the AP's lease
+# or a VPN interface must never replace the hotel resolvers).
+WAN_IFACE=${TRAVELPI_WAN_IFACE:-wlan0}
+# A wired uplink counts too, but only while eth0 actually holds the default route.
+if [ "${1:-}" != "$WAN_IFACE" ]; then
+    if [ "${1:-}" = eth0 ] && [ -n "$(ip route show default dev eth0 2>/dev/null)" ]; then :; else exit 0; fi
+fi
+case ${2:-} in dhcp4-change|up) ;; *) exit 0 ;; esac
+CFG=${ADGUARD_YAML:-/opt/adguardhome/conf/AdGuardHome.yaml}
+[ -f "$CFG" ] || exit 0
+
+NSERVERS=$(printf '%s\n' "${DHCP4_NAMESERVERS:-}" | tr ' ' '\n' | grep -E '^[0-9.]+$' | head -3)
+[ -n "$NSERVERS" ] || exit 0
+
+# MagicDNS domains (a tailnet can carry several, e.g. a legacy one), taken
+# from every node FQDN. JSON has a space after the colon and values carry a
+# trailing dot.
+DOMAINS=$(tailscale status --json 2>/dev/null | grep -o '"DNSName"[[:space:]]*:[[:space:]]*"[^"]*\.ts\.net' | sed 's/.*"DNSName"[[:space:]]*:[[:space:]]*"//' | cut -d. -f2- | sort -u | tr '\n' ' ')
+if [ -z "$DOMAINS" ]; then
+    HOSTS_DOMAIN=$(sed -n 's/^  domain: *\(.*\)/\1/p' /etc/hosts 2>/dev/null | head -1)
+    [ -n "$HOSTS_DOMAIN" ] && DOMAINS="$HOSTS_DOMAIN "
+fi
+
+# Optional home-local DNS: /etc/travelpi-home-dns holds "domain ip" pairs
+# (e.g. "home.example 100.x.y.z") forwarded through the tunnel to the
+# home resolver, so room devices resolve home-local names too.
+HOMEFWD=$(awk 'NF==2 && $1 ~ /^[a-z0-9.-]+$/ && $2 ~ /^[0-9.]+$/{print $1" "$2}
+    ' "${TRAVELPI_HOME_DNS:-/etc/travelpi-home-dns}" 2>/dev/null | head -4 | tr '\n' ';')
+
+# Temp file beside the config so the final mv is an atomic same-filesystem rename.
+TMP=$(mktemp "$CFG.XXXXXX") || exit 1
+trap 'rm -f "$TMP"' EXIT
+NS_LIST=$(printf '%s' "$NSERVERS" | tr '\n' ' ')
+EI=$(awk '/^[[:space:]]*upstream_dns:/{f=1;next} f&&/^[[:space:]]*- /{match($0, /^[[:space:]]*/); print substr($0, 1, RLENGTH); exit}' "$CFG")
+[ -n "$EI" ] || EI="    "
+awk -v n="$NS_LIST" -v dom="$DOMAINS" -v home="$HOMEFWD" -v ei="$EI" '
+    /^([[:space:]]*)upstream_dns:/ && !inup {
+        inup = 1
+        print
+        split(dom, dm, " ")
+        for (i = 1; dm[i] != ""; i++) printf "%s- \"[/%s/]100.100.100.100\"\n", ei, dm[i]
+        split(home, hm, ";")
+        for (i = 1; hm[i] != ""; i++) {
+            split(hm[i], pair, " ")
+            if (pair[1] != "" && pair[2] != "") printf "%s- \"[/%s/]%s\"\n", ei, pair[1], pair[2]
+        }
+        split(n, a, " ")
+        for (i = 1; a[i] != ""; i++) printf "%s- %s\n", ei, a[i]
+        next
+    }
+    inup && /^[[:space:]]*- / { next }
+    inup && /^[[:space:]]*[a-zA-Z_]+:/ { inup = 0 }
+    { print }
+' "$CFG" > "$TMP" || exit 1
+chown --reference="$CFG" "$TMP" 2>/dev/null || :
+chmod 0640 "$TMP" && mv "$TMP" "$CFG" || exit 1
+
+grep -q "127.0.0.1:5335" "$CFG" 2>/dev/null || \
+    sed -i 's/^  fallback_dns: \[\]/  fallback_dns:\n    - 127.0.0.1:5335/' "$CFG"
+
+# DNS64 synthesis prefix (RFC 6052 well-known): AdGuard answers AAAA for
+# IPv4-only domains so room devices can reach them through the NAT64
+# gateway route advertised alongside this prefix.
+grep -q '^  nat64_prefix:' "$CFG" 2>/dev/null || \
+    sed -i '/^  upstream_dns_file:/i\ \ nat64_prefix: "64:ff9b::\/96"' "$CFG"
+
+systemctl restart adguardhome.service >/dev/null 2>&1
+logger -t travelpi-adguard-hotel-dns "AdGuard WAN DNS -> $(printf '%s ' $NSERVERS)| tailnet split: ${DOMAINS:-none} | Unbound fallback"

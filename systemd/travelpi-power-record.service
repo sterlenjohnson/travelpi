@@ -1,0 +1,13 @@
+[Unit]
+Description=TravelPi boot-time power telemetry record
+After=local-fs.target time-sync.target
+Wants=time-sync.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/libexec/travelpi-power-record start
+ExecStop=/usr/local/libexec/travelpi-power-record stop
+
+[Install]
+WantedBy=multi-user.target

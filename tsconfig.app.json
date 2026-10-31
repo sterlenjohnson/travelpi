@@ -1,0 +1,13 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "lib": ["ES2022", "DOM"],
+    "strict": false,
+    "noEmit": false,
+    "outDir": "dist/app",
+    "skipLibCheck": true
+  },
+  "files": ["travelpi.ts"]
+}

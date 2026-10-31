@@ -1,0 +1,14 @@
+[Unit]
+Description=TravelPi AP static IP keeper for the current AP radio
+After=NetworkManager.service
+Before=hostapd.service dnsmasq.service
+ConditionPathExists=/etc/hostapd/hostapd.conf
+
+[Service]
+Type=simple
+ExecStart=/usr/local/libexec/travelpi-ap-ip watch
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

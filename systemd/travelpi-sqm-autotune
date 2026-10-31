@@ -1,0 +1,135 @@
+#!/bin/sh
+# TravelPi SQM auto-tuner: measures real download/upload throughput on the
+# live hotel uplink and retunes CAKE to 90% of measured capacity, per
+# direction (bufferbloat practice: shape just below what the link sustains
+# so the shaper, not the hotel radio, holds the queue). Run by
+# travelpi-sqm-tune.timer every 4 hours — hotel links drift with congestion
+# and re-association, so a rate that was right at check-in goes stale.
+#
+# Manual pin wins: the Cockpit "set CAKE rate" mutation rewrites
+# /etc/default/travelpi-sqm with TRAVELPI_SQM_AUTOTUNE=no, which disables
+# this tuner. Setting TRAVELPI_SQM_AUTOTUNE=yes (key absent = yes) re-enables.
+# A measurement is adopted only when it moves a direction by >=15% so probe
+# noise never oscillates the shaper. Weak probes (captive portal, offline)
+# keep the last working schedule.
+# Cost: each run downloads ~20 MB and uploads ~10 MB through the WAN (about
+# 180 MB/day at the 4-hour cadence), so `make deploy` enables the timer only
+# with SQM_AUTOTUNE=1 (metered hotel links stay untouched by default).
+set -u
+# Path/command overrides are test seams only: honored solely with TRAVELPI_TEST=1,
+# so a hostile environment can never pick a command or file used as root.
+[ "${TRAVELPI_TEST:-}" = 1 ] || unset TRAVELPI_AUTOTUNE_STATE_DIR TRAVELPI_AUTOTUNE_ENV TRAVELPI_AUTOTUNE_NO_APPLY TRAVELPI_AUTOTUNE_PROBE_DOWN TRAVELPI_AUTOTUNE_PROBE_UP
+STATE_DIR=${TRAVELPI_AUTOTUNE_STATE_DIR:-/var/lib/travelpi}
+ENV_FILE=${TRAVELPI_AUTOTUNE_ENV:-/etc/default/travelpi-sqm}
+STATE=$STATE_DIR/sqm-autotune.json
+MIN_MBIT=2 MAX_MBIT=300 HEADROOM=90 MIN_DELTA=0.15
+NO_APPLY=${TRAVELPI_AUTOTUNE_NO_APPLY:-0}
+# Probe through the shaped WAN (same interface travelpi-sqm.sh shapes), never
+# whichever route happens to win, so a VPN or wired link cannot skew the rate.
+WAN=${TRAVELPI_AUTOTUNE_WAN:-wlan0}
+PAYLOAD=
+cleanup() { [ -z "$PAYLOAD" ] || rm -f "$PAYLOAD"; }
+trap cleanup EXIT
+trap 'exit 1' INT TERM
+
+log() { logger -t travelpi-sqm-autotune "$1" 2>/dev/null || true; }
+
+probe() {
+    # $1 = down|up; prints bytes/second. Stub vars are the test seam.
+    mode=$1
+    case $mode in
+    down) stubvar=TRAVELPI_AUTOTUNE_PROBE_DOWN ;;
+    up)   stubvar=TRAVELPI_AUTOTUNE_PROBE_UP ;;
+    esac
+    stub=$(printenv "$stubvar" 2>/dev/null || true)
+    if [ -n "$stub" ]; then printf '%s\n' "$stub"; return 0; fi
+    case $mode in
+    down)
+        curl --interface "$WAN" -o /dev/null -sS -w '%{speed_download}' --max-time 25 \
+            'https://speed.cloudflare.com/__down?bytes=20000000'
+        ;;
+    up)
+        # Private 0600 file on tmpfs (/run), never a predictable /tmp name
+        # that a symlink could redirect.
+        PAYLOAD=$(mktemp /run/travelpi-sqm-payload.XXXXXX) || return 1
+        dd if=/dev/zero of="$PAYLOAD" bs=1048576 count=10 2>/dev/null
+        curl --interface "$WAN" -o /dev/null -sS -w '%{speed_upload}' --max-time 25 \
+            -X POST --data-binary @"$PAYLOAD" 'https://speed.cloudflare.com/__up'
+        rm -f "$PAYLOAD"; PAYLOAD=
+        ;;
+    esac
+}
+
+target() {
+    # bytes/s -> headroom Mbit as integer, clamped
+    awk -v b="$1" -v h="$HEADROOM" -v lo="$MIN_MBIT" -v hi="$MAX_MBIT" \
+        'BEGIN{v=int(b*8*h/100/1000000+0.5); if(v<lo)v=lo; if(v>hi)v=hi; print v}'
+}
+
+prev_applied() {
+    v=$(sed -n 's/.*"applied_'"$1"'_mbit": *\([0-9]*\).*/\1/p' "$STATE" 2>/dev/null | tail -1)
+    printf '%s' "${v:-0}"
+}
+
+big_delta() {
+    awk -v n="$1" -v o="$2" -v m="$MIN_DELTA" \
+        'BEGIN{if(o<=0){print "yes";exit} d=(n-o)/o; if(d<0)d=-d; print (d>=m)?"yes":"no"}'
+}
+
+pinned() { grep -q '^TRAVELPI_SQM_AUTOTUNE=no' "$ENV_FILE" 2>/dev/null; }
+
+# Manual pin disables the tuner.
+if pinned; then
+    log "rate pinned from dashboard; auto-tune skipped"
+    exit 0
+fi
+
+mkdir -p "$STATE_DIR"
+ts=$(date +%s)
+db=$(probe down 2>/dev/null || true); db=${db%%.*}
+ub=$(probe up 2>/dev/null || true); ub=${ub%%.*}
+
+if ! [ "${db:-0}" -gt 1000000 ] 2>/dev/null || ! [ "${ub:-0}" -gt 200000 ] 2>/dev/null; then
+    # Captive portal, offline, or a dead link: keep the working schedule.
+    if [ -f "$STATE" ]; then
+        log "probe weak (down=${db:-0} up=${ub:-0} B/s); keeping current rates"
+        exit 0
+    fi
+    printf '{"ts": %s, "last_error": "probe_failed"}\n' "$ts" > "$STATE"
+    log "probe failed with no prior state; leaving shaper untouched"
+    exit 0
+fi
+
+td=$(target "$db"); tu=$(target "$ub")
+ad=$(prev_applied down); au=$(prev_applied up)
+adopt_down=$(big_delta "$td" "$ad")
+adopt_up=$(big_delta "$tu" "$au")
+[ "$adopt_down" = yes ] && new_ad=$td || new_ad=$ad
+[ "$adopt_up" = yes ] && new_au=$tu || new_au=$au
+adopted=no
+[ "$adopt_down" = yes ] || [ "$adopt_up" = yes ] && adopted=yes
+
+# The probes take up to ~50s; the operator may have pinned a rate meanwhile.
+# Re-check right before the replace so a fresh pin is never overwritten.
+if [ "$adopted" = yes ] && pinned; then
+    log "rate pinned during probe; discarding measurement"
+    exit 0
+fi
+
+if [ "$adopted" = yes ]; then
+    tmp=$(mktemp "$STATE_DIR/.sqm-env.XXXXXX") || exit 1
+    { printf 'TRAVELPI_SQM_RATE=%sMbit\n' "$new_au"
+      printf 'TRAVELPI_SQM_RATE_DOWN=%sMbit\n' "$new_ad"
+      printf 'TRAVELPI_SQM_AUTOTUNE=yes\n'
+    } > "$tmp" && chmod 0644 "$tmp" && ! pinned && mv "$tmp" "$ENV_FILE" || { rm -f "$tmp"; log "env not replaced (write failed or pinned)"; exit 0; }
+    if [ "$NO_APPLY" != 1 ]; then
+        systemctl restart travelpi-sqm.service
+    fi
+    log "retuned CAKE: up ${new_au}Mbit down ${new_ad}Mbit (measured $((db*8/1000000))/$((ub*8/1000000)) Mbit)"
+else
+    log "measured ${td}/${tu}Mbit within ${MIN_DELTA} of applied ${ad}/${au}Mbit; keeping"
+fi
+
+printf '{"ts": %s, "down_mbit": %s, "up_mbit": %s, "applied_down_mbit": %s, "applied_up_mbit": %s, "adopted": %s}\n' \
+    "$ts" "$((db*8/1000000))" "$((ub*8/1000000))" "$new_ad" "$new_au" \
+    "$([ "$adopted" = yes ] && echo true || echo false)" > "$STATE"

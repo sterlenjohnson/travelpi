@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light dark">
+    <title>TravelPi Tunnels</title>
+    <link rel="stylesheet" href="travelpi.css">
+  </head>
+  <body>
+    <main id="travelpi-app" class="app-shell" aria-busy="false">
+      <header class="app-header">
+        <div class="brand-lockup">
+          <span class="brand-mark" aria-hidden="true">TP</span>
+          <div>
+            <p class="eyebrow">TravelPi Cockpit</p>
+            <h1>Secure tunnels &amp; devices</h1>
+          </div>
+        </div>
+        <div class="header-tools">
+          <span class="refresh-meta">Updated <time id="last-updated" datetime="">Not yet</time> <span id="freshness-state" class="muted">(not checked)</span></span>
+          <button id="refresh" class="button button-quiet" type="button">Refresh</button>
+        </div>
+      </header>
+
+      <div class="vitals-strip" aria-label="Vitals">
+        <span id="vitals-internet" class="vital-chip" data-state="neutral">Internet checking&hellip;</span>
+        <span id="vitals-ap" class="vital-chip" data-state="neutral">AP checking&hellip;</span>
+        <span id="vitals-dns" class="vital-chip" data-state="neutral">DNS checking&hellip;</span>
+        <span id="vitals-mem" class="vital-chip" data-state="neutral">Mem checking&hellip;</span>
+        <span id="vitals-power" class="vital-chip" data-state="neutral">Power checking&hellip;</span>
+      </div>
+      <p id="issue-banner" class="issue-banner" data-state="ok">Loading status&hellip;</p>
+
+      <p id="notice" class="notice" role="status" aria-live="polite">Waiting for the first status refresh.</p>
+
+      <details id="pending-bar" class="pending-bar" hidden open aria-labelledby="pending-title" aria-live="polite">
+        <summary class="pending-summary">
+          <span class="pending-copy">
+            <span class="eyebrow" id="pending-title">Pending changes</span>
+            <strong id="pending-summary">None</strong>
+          </span>
+          <span class="summary-meta">Show or hide</span>
+        </summary>
+        <div class="pending-content">
+          <p id="pending-hint" class="pending-hint">Nothing has been applied yet.</p>
+          <ul id="pending-list" class="pending-list"></ul>
+          <div class="button-row">
+            <button id="apply-pending" class="button button-primary" type="button">Apply Changes</button>
+            <button id="rollback-pending" class="button button-secondary" type="button">Rollback Pending</button>
+          </div>
+        </div>
+      </details>
+
+      <section class="dashboard-grid" aria-label="Secure tunnels">
+        <article id="vpn-card" class="feature-card feature-card-internet">
+          <header class="card-header">
+            <div>
+              <p class="eyebrow">Secure tunnel</p>
+              <h2>Secure tunnels</h2>
+            </div>
+            <span id="vpn-chip" class="status-badge status-badge-neutral">Checking</span>
+          </header>
+          <p id="vpn-detail" class="compact-copy">Choose the managed tunnel to enable or disable. Confirmation is required.</p>
+          <div class="vpn-controls">
+            <label for="vpn-provider">Tunnel</label>
+            <select id="vpn-provider">
+              <option value="tailscale">Tailscale</option>
+              <option value="wireguard">WireGuard (wg0)</option>
+            </select>
+            <button id="vpn-toggle" class="button button-secondary" type="button">Toggle tunnel</button>
+          </div>
+          <dl class="compact-list">
+            <div><dt>Active</dt><dd id="vpn-tunnel">Checking</dd></div>
+            <div><dt>Endpoint</dt><dd id="vpn-endpoint">Service-managed</dd></div>
+          </dl>
+          <div id="tailscale-auth" class="vpn-auth" hidden>
+            <p id="tailscale-auth-detail" class="compact-copy">Tailscale needs sign-in to bring up the tunnel.</p>
+            <p><a id="tailscale-auth-url" href="#" target="_blank" rel="noopener noreferrer">Open Tailscale login</a></p>
+            <div class="vpn-auth-row">
+              <input id="tailscale-authkey" type="password" placeholder="authkey (optional)" autocomplete="off" />
+              <button id="tailscale-auth-btn" class="button button-secondary" type="button">Authenticate</button>
+            </div>
+          </div>
+          <details class="vpn-details" open>
+            <summary>Connection details</summary>
+            <dl class="compact-list">
+              <div><dt>Tunnel IP</dt><dd id="vpn-addresses">—</dd></div>
+              <div><dt>Exit node</dt><dd id="vpn-exit-node">—</dd></div>
+              <div><dt>Peers</dt><dd id="vpn-peers">—</dd></div>
+              <div><dt>Routes</dt><dd id="vpn-routes">—</dd></div>
+              <div><dt>Handshake</dt><dd id="vpn-handshake">—</dd></div>
+            </dl>
+          </details>
+        </article>
+
+        <article id="wake-card" class="compact-card">
+          <header class="card-header">
+            <div>
+              <p class="eyebrow">Wake-on-LAN</p>
+              <h2>Wake devices</h2>
+            </div>
+          </header>
+          <p class="compact-copy">Magic packets ride the tailnet to wake sleeping machines. Confirmation is required per wake.</p>
+          <ul id="vpn-wake-peers" class="wake-peer-list"></ul>
+        </article>
+      </section>
+
+      <p class="card-action-line"><a class="text-link" href="/travelpi/">&larr; Router overview</a></p>
+
+      <dialog id="confirm-dialog" aria-labelledby="confirm-title" aria-describedby="confirm-message">
+        <div class="dialog-content">
+          <p class="eyebrow">Confirm action</p>
+          <h2 id="confirm-title">Are you sure?</h2>
+          <p id="confirm-message">This action may interrupt the router. Do you want to continue?</p>
+          <div class="dialog-actions">
+            <button id="confirm-cancel" class="button button-secondary" type="button" value="cancel">Cancel</button>
+            <button id="confirm-accept" class="button button-danger" type="button" value="accept">Confirm</button>
+          </div>
+        </div>
+      </dialog>
+    </main>
+
+    <noscript><p class="no-script">TravelPi requires JavaScript to read status from Cockpit.</p></noscript>
+    <script src="../base1/cockpit.js" defer></script>
+    <script src="travelpi-mutations.js" defer></script>
+    <script src="travelpi-typed.js" defer></script>
+    <script src="travelpi.js" defer></script>
+  </body>
+</html>

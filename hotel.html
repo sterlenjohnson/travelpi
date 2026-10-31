@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light dark">
+    <title>TravelPi Hotel</title>
+    <link rel="stylesheet" href="travelpi.css">
+  </head>
+  <body>
+    <main id="travelpi-app" class="app-shell" aria-busy="false">
+      <header class="app-header">
+        <div class="brand-lockup">
+          <span class="brand-mark" aria-hidden="true">TP</span>
+          <div>
+            <p class="eyebrow">TravelPi Cockpit</p>
+            <h1>Hotel &amp; privacy</h1>
+          </div>
+        </div>
+        <div class="header-tools">
+          <span class="refresh-meta">Updated <time id="last-updated" datetime="">Not yet</time> <span id="freshness-state" class="muted">(not checked)</span></span>
+          <button id="refresh" class="button button-quiet" type="button">Refresh</button>
+        </div>
+      </header>
+
+      <div class="vitals-strip" aria-label="Vitals">
+        <span id="vitals-internet" class="vital-chip" data-state="neutral">Internet checking&hellip;</span>
+        <span id="vitals-ap" class="vital-chip" data-state="neutral">AP checking&hellip;</span>
+        <span id="vitals-dns" class="vital-chip" data-state="neutral">DNS checking&hellip;</span>
+        <span id="vitals-mem" class="vital-chip" data-state="neutral">Mem checking&hellip;</span>
+        <span id="vitals-power" class="vital-chip" data-state="neutral">Power checking&hellip;</span>
+      </div>
+      <p id="issue-banner" class="issue-banner" data-state="ok">Loading status&hellip;</p>
+
+      <p id="notice" class="notice" role="status" aria-live="polite">Waiting for the first status refresh.</p>
+
+      <details id="pending-bar" class="pending-bar" hidden open aria-labelledby="pending-title" aria-live="polite">
+        <summary class="pending-summary">
+          <span class="pending-copy">
+            <span class="eyebrow" id="pending-title">Pending changes</span>
+            <strong id="pending-summary">None</strong>
+          </span>
+          <span class="summary-meta">Show or hide</span>
+        </summary>
+        <div class="pending-content">
+          <p id="pending-hint" class="pending-hint">Nothing has been applied yet.</p>
+          <ul id="pending-list" class="pending-list"></ul>
+          <div class="button-row">
+            <button id="apply-pending" class="button button-primary" type="button">Apply Changes</button>
+            <button id="rollback-pending" class="button button-secondary" type="button">Rollback Pending</button>
+          </div>
+        </div>
+      </details>
+
+      <section class="dashboard-grid" aria-label="Hotel connection and privacy">
+        <article id="hotel-connect-card" class="feature-card feature-card-internet">
+          <header class="card-header">
+            <div>
+              <p class="eyebrow">Hotel Wi-Fi (WAN)</p>
+              <h2>Connect to hotel Wi-Fi</h2>
+            </div>
+            <span id="wan-chip" class="status-badge status-badge-neutral"><span id="wan-chip-dot" class="badge-dot" aria-hidden="true"></span><span id="wan-chip-text">Unknown</span></span>
+          </header>
+          <p class="compact-copy">Uses <span class="interface-secondary">wlan0</span> for this attempt. Credentials stay in memory and are cleared from the form.</p>
+          <div class="scan-row"><button id="scan-wifi" class="button button-secondary" type="button">Scan wlan0</button><span id="scan-wifi-status" class="action-note">Choose from nearby networks; strongest appears first.</span></div>
+          <div id="wifi-scan-results" class="wifi-scan-results" hidden></div>
+          <div id="portal-row" class="scan-row" hidden>
+            <span id="portal-row-text" class="action-note">Captive portal detected on the hotel network.</span>
+            <a id="portal-open" class="button button-secondary" href="#" target="_blank" rel="noopener noreferrer">Open hotel portal</a>
+            <button id="portal-recheck" class="button button-secondary" type="button">Re-check portal</button>
+          </div>
+          <ol id="portal-steps" class="portal-steps" hidden>
+            <li>Open <strong>http://neverssl.com</strong> on a device joined to this router.</li>
+            <li>Complete the portal sign-in on that device.</li>
+            <li>Press <strong>Re-check portal</strong>.</li>
+          </ol>
+          <form id="hotel-form" class="compact-form" data-confirmation="required">
+            <div class="form-grid">
+              <div class="field-group">
+                <label for="hotel-ssid">Hotel SSID</label>
+                <input id="hotel-ssid" name="hotel-ssid" type="text" maxlength="32" autocomplete="off" required>
+              </div>
+              <div class="field-group">
+                <label for="hotel-password">Password <span class="muted">(optional)</span></label>
+                <input id="hotel-password" name="hotel-password" type="password" maxlength="128" autocomplete="new-password" spellcheck="false" aria-describedby="hotel-password-help">
+                <small id="hotel-password-help">Leave blank for an open network or captive portal.</small>
+              </div>
+            </div>
+            <label class="checkbox-line"><input id="hotel-hidden" name="hotel-hidden" type="checkbox"> Hidden network <span class="muted">(SSID is not broadcast; type it exactly)</span></label>
+            <button class="button button-primary" type="submit">Stage hotel connection</button>
+          </form>
+        </article>
+
+        <article id="mac-clone-card" class="compact-card">
+          <header class="card-header">
+            <div>
+              <p class="eyebrow">Privacy</p>
+              <h2>Clone WAN MAC</h2>
+            </div>
+            <span id="mac-clone-chip" class="status-badge status-badge-neutral">Ready</span>
+          </header>
+          <p class="compact-copy">Apply a MAC to <span class="interface-secondary">wlan0</span> — like GL-iNet MAC Clone. Hotel spoof stays.</p>
+          <dl class="compact-list compact-list-tight">
+            <div><dt>Current MAC</dt><dd id="mac-clone-current" class="copy-field"><input type="text" value="&mdash;" readonly aria-label="Current cloned MAC address"><button id="copy-mac-clone" class="button button-secondary button-copy" type="button">Copy</button></dd></div>
+            <div><dt>Status</dt><dd id="mac-clone-status"><span class="small muted">No clone active</span></dd></div>
+          </dl>
+          <form id="mac-form" class="compact-form" data-confirmation="required">
+            <div class="field-group">
+              <label for="clone-mac">MAC address</label>
+              <input id="clone-mac" name="clone-mac" type="text" inputmode="text" maxlength="17" placeholder="02:11:22:33:44:55" autocomplete="off" spellcheck="false" pattern="(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}" required>
+            </div>
+            <button class="button button-primary" type="submit">Stage MAC clone</button>
+            <button class="button button-secondary" type="button" id="clone-mac-random">Randomize MAC (privacy)</button>
+            <button class="button button-secondary" type="button" id="clone-mac-default">Reset MAC to hardware default</button>
+          </form>
+        </article>
+      </section>
+
+      <section class="section-block" aria-labelledby="wan-role-heading">
+        <article class="wide-card wan-role-card">
+          <header class="card-header">
+            <div>
+              <p class="eyebrow">Radio bands</p>
+              <h2 id="wan-role-heading">Radio bands</h2>
+            </div>
+          </header>
+          <p id="radio-roles-line" class="compact-copy">WAN: wlan0 · LAN: wlan1. Swapping the roles is not available.</p>
+          <div class="role-controls">
+            <div class="field-group" id="wan-band-field" hidden>
+              <label id="wan-band-label" for="wan-band-select">WAN radio (wlan0) band</label>
+              <select id="wan-band-select" name="wan-band-select"></select>
+              <button id="apply-wan-band" class="button button-accent" type="button">Stage WAN band</button>
+            </div>
+            <div class="field-group" id="lan-band-field" hidden>
+              <label id="lan-band-label" for="lan-band-select">LAN radio (wlan1) band</label>
+              <select id="lan-band-select" name="lan-band-select"></select>
+              <button id="apply-lan-band" class="button button-accent" type="button">Stage LAN band</button>
+            </div>
+            <button id="repair-radios" class="button button-secondary" type="button">Repair radios</button>
+          </div>
+          <p id="role-swap-reason" class="control-reason muted">Role swap unavailable: needs a verified wired LAN uplink (ADR 0002).</p>
+          <p id="wan-band-reason" class="control-reason muted" hidden>WAN band can only be changed while hotel Wi-Fi is connected.</p>
+          <p id="radio-bands-unavailable" class="action-note">The radios have not reported any usable bands yet.</p>
+        </article>
+      </section>
+
+      <p class="card-action-line"><a class="text-link" href="/travelpi/">&larr; Router overview</a></p>
+
+      <dialog id="confirm-dialog" aria-labelledby="confirm-title" aria-describedby="confirm-message">
+        <div class="dialog-content">
+          <p class="eyebrow">Confirm action</p>
+          <h2 id="confirm-title">Are you sure?</h2>
+          <p id="confirm-message">This action may interrupt the router. Do you want to continue?</p>
+          <div class="dialog-actions">
+            <button id="confirm-cancel" class="button button-secondary" type="button" value="cancel">Cancel</button>
+            <button id="confirm-accept" class="button button-danger" type="button" value="accept">Confirm</button>
+          </div>
+        </div>
+      </dialog>
+    </main>
+
+    <noscript><p class="no-script">TravelPi requires JavaScript to read status from Cockpit.</p></noscript>
+    <script src="../base1/cockpit.js" defer></script>
+    <script src="travelpi-mutations.js" defer></script>
+    <script src="travelpi-typed.js" defer></script>
+    <script src="travelpi.js" defer></script>
+  </body>
+</html>

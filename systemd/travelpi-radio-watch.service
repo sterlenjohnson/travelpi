@@ -1,0 +1,16 @@
+[Unit]
+Description=TravelPi radio auto-recovery watchdog for the AP radio
+After=NetworkManager.service hostapd.service wlan1-static-ip.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/libexec/travelpi-radio-watch
+RuntimeDirectory=travelpi-radio-watch
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+Restart=always
+RestartSec=5
+Nice=10
+
+[Install]
+WantedBy=multi-user.target

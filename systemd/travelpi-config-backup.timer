@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily TravelPi config backup
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=24h
+AccuracySec=1h
+
+[Install]
+WantedBy=timers.target

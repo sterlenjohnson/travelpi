@@ -1,0 +1,199 @@
+#!/bin/sh
+# Move the shared-ID USB Wi-Fi from the MT7921 driver to the MT7925
+# (Wi-Fi 6E) driver, run as root at deploy.
+#
+# The stick reports USB ID 0e8d:7961, which both mt7921u and mt7925u claim.
+# Deploy installs /etc/modprobe.d/travelpi-mt7925.conf blacklisting mt7921u
+# for future boots; this script performs the live switch.
+#
+# Observed incident: some kernels (e.g. 6.12.75+rpt) ship mt7925u with an alias
+# table covering USB ID 0e8d:7925 only - the MT7925AU reuses the MT7921AU
+# ID 7961 in NEWER kernels (OpenWrt's mt76 sees 6E there). Unbinding 7961
+# from mt7921u on this kernel left the radio with NO driver. The switch
+# therefore gates on the target driver's alias table covering the device's
+# actual USB ID, removes the blacklist when support is missing (so a boot
+# never ends up driverless), and binds via the interface driver directory
+# (drivers/usb/bind takes the device dir, not the interface dir).
+#
+# Restore-on-fail: if the device does not come back on mt7925u, the
+# blacklist is removed, mt7921u is re-probed and bound, and hostapd/dnsmasq/
+# radvd restart on the proven 2.4/5 profile. Idempotent: exits 0 when the
+# AP radio is already mt7925u or mt7921u is not in play.
+#
+# Also runs at every boot as travelpi-radio-driver.service (Before=hostapd,
+# TRAVELPI_RADIO_BOOT=1): after a kernel change the blacklist can leave the
+# radio with no driver at all, so the gate re-checks it before hostapd starts.
+# At boot the services are not running yet, so they are left alone.
+set -u
+# Path/command overrides are test seams only: honored solely with TRAVELPI_TEST=1,
+# so a hostile environment can never pick a command or file used as root.
+[ "${TRAVELPI_TEST:-}" = 1 ] || unset TRAVELPI_BLACKLIST TRAVELPI_SYS_ROOT TRAVELPI_MODINFO
+BLACKLIST=${TRAVELPI_BLACKLIST:-/etc/modprobe.d/travelpi-mt7925.conf}
+SYS=${TRAVELPI_SYS_ROOT:-/sys}
+MODINFO=${TRAVELPI_MODINFO:-/usr/sbin/modinfo}
+BOOT=${TRAVELPI_RADIO_BOOT:-0}
+WAIT=${TRAVELPI_RADIO_WAIT:-0}
+log() {
+    logger -t travelpi-radio-driver "$1" 2>/dev/null || echo "$1"
+}
+# systemctl wrapper: no-op at boot (hostapd/dnsmasq have not started, and a
+# systemctl call inside a unit ordered Before them would wait on itself).
+svc() {
+    [ "$BOOT" = 1 ] && return 0
+    systemctl "$@" >/dev/null 2>&1
+}
+# Does the mt7925u alias table claim this USB product id (upper-case hex)?
+claims_7925() {
+    [ -n "$1" ] && $MODINFO -F alias mt7925u 2>/dev/null | grep -qi "p$1"
+}
+# Find the Wi-Fi USB device by vendor id when no netdev exists (driverless).
+find_wifi_usb_device() {
+    for d in "$SYS"/bus/usb/devices/*; do
+        [ "$(cat "$d/idVendor" 2>/dev/null)" = 0e8d ] || continue
+        basename "$d"
+        return 0
+    done
+    return 1
+}
+# Bind the interface to whichever driver owns the radio on this kernel.
+bind_available_driver() {
+    # $1 interface dir (1-1.2:1.0), $2 device dir (1-1.2)
+    idp=$(tr 'a-z' 'A-Z' < "$SYS/bus/usb/devices/$2/idProduct" 2>/dev/null)
+    if claims_7925 "$idp" && modprobe mt7925u 2>/dev/null; then
+        echo "$1" > "$SYS/bus/usb/drivers/mt7925u/bind" 2>/dev/null
+        log "driverless radio ($2): bound mt7925u"
+    else
+        rm -f "$BLACKLIST" 2>/dev/null
+        modprobe mt7921u 2>/dev/null
+        echo "$1" > "$SYS/bus/usb/drivers/mt7921u/bind" 2>/dev/null
+        log "driverless radio ($2): mt7925u does not claim USB id ${idp:-?}; blacklist removed, mt7921u rebound"
+    fi
+    svc restart hostapd
+    svc restart dnsmasq
+}
+
+# Resolve the USB interface directory (1-1.2:1.0) and device directory
+# (1-1.2) backing the Wi-Fi radio.
+find_phys() {
+    phys_if=""
+    phys_dev=""
+    for iface in wlan1 wlan0; do
+        d=$(readlink -f "$SYS/class/net/$iface/device" 2>/dev/null) || continue
+        case "$d" in
+            */usb[0-9]*/*)
+                phys_if=$(basename "$d")
+                phys_dev=$(basename "$(dirname "$d")")
+                return 0
+                ;;
+        esac
+    done
+    return 1
+}
+# At boot the stick may still be enumerating: wait (bounded by
+# TRAVELPI_RADIO_WAIT seconds) for the netdev to appear.
+waited=0
+while ! find_phys && [ "$waited" -lt "$WAIT" ]; do
+    waited=$((waited + 1))
+    sleep 1
+done
+if [ -z "$phys_if" ]; then
+    # No Wi-Fi netdev. If the stick is present but has no driver bound (a
+    # kernel change plus the blacklist), repair that instead of leaving the
+    # radio dead.
+    dev=$(find_wifi_usb_device) || dev=""
+    if [ -n "$dev" ] && [ -e "$SYS/bus/usb/devices/$dev:1.0" ] && [ ! -e "$SYS/bus/usb/devices/$dev:1.0/driver" ]; then
+        bind_available_driver "$dev:1.0" "$dev"
+        exit 0
+    fi
+    log "no USB Wi-Fi interface found; nothing to do"
+    exit 0
+fi
+if [ ! -e "$SYS/bus/usb/devices/$phys_dev" ]; then
+    log "no USB Wi-Fi interface found; nothing to do"
+    exit 0
+fi
+
+# Which driver owns the phy on this USB device right now?
+current=""
+for phy in "$SYS"/class/ieee80211/phy*; do
+    parent=$(readlink -f "$phy/device" 2>/dev/null) || continue
+    case "$parent" in
+        *"$phys_dev"*|*"$phys_if"*)
+            current=$(basename "$(readlink -f "$phy/device/driver" 2>/dev/null)" 2>/dev/null)
+            break
+            ;;
+    esac
+done
+case "$current" in
+    mt7925u)
+        exit 0
+        ;;
+    mt7921u)
+        :
+        ;;
+    *)
+        if [ -z "$current" ]; then
+            # No driver owns the phy: never leave the radio driverless.
+            bind_available_driver "$phys_if" "$phys_dev"
+            exit 0
+        fi
+        log "AP phy driver is $current; not a 7961 switch case"
+        exit 0
+        ;;
+esac
+
+if ! modprobe mt7925u 2>/dev/null; then
+    rm -f "$BLACKLIST" 2>/dev/null
+    log "mt7925u module unavailable on this kernel; keeping mt7921u"
+    exit 0
+fi
+
+# Kernel support gate: the mt7925u alias table must claim this device's
+# USB product ID. Kernel 6.12.75 has only 07925; the 7961 pairing arrives
+# in newer kernels. Switching without this gate leaves the radio driverless.
+idp=$(tr 'a-z' 'A-Z' < "$SYS/bus/usb/devices/$phys_dev/idProduct" 2>/dev/null)
+if ! claims_7925 "$idp"; then
+    rm -f "$BLACKLIST" 2>/dev/null
+    log "mt7925u on this kernel does not claim USB id ${idp:-?}; keeping mt7921u (6E needs a newer kernel whose mt7925u covers ${idp:-7961})"
+    exit 0
+fi
+
+svc stop hostapd
+svc stop dnsmasq
+echo "$phys_if" > "$SYS/bus/usb/drivers/mt7921u/unbind" 2>/dev/null
+modprobe -r mt7921u 2>/dev/null
+echo "$phys_if" > "$SYS/bus/usb/drivers/mt7925u/bind" 2>/dev/null
+
+# Poll for the MT7925 phy: firmware load can take well over a second, and
+# declaring failure on a fixed sleep would flake the switch every deploy.
+switched=""
+tries=0
+while [ "$tries" -lt 30 ]; do
+    for phy in "$SYS"/class/ieee80211/phy*; do
+        parent=$(readlink -f "$phy/device" 2>/dev/null) || continue
+        case "$parent" in
+            *"$phys_dev"*|*"$phys_if"*)
+                switched=$(basename "$(readlink -f "$phy/device/driver" 2>/dev/null)" 2>/dev/null)
+                break
+                ;;
+        esac
+    done
+    if [ "$switched" = mt7925u ]; then break; fi
+    tries=$((tries + 1))
+    sleep 1
+done
+if [ "$switched" != mt7925u ]; then
+    log "mt7925u bind failed (got ${switched:-none}); restoring mt7921u"
+    rm -f "$BLACKLIST" 2>/dev/null
+    modprobe mt7921u 2>/dev/null
+    echo "$phys_if" > "$SYS/bus/usb/drivers/mt7921u/bind" 2>/dev/null
+    svc restart hostapd
+    svc restart dnsmasq
+    svc try-restart radvd
+    exit 0
+fi
+
+svc restart hostapd
+svc restart dnsmasq
+svc try-restart radvd
+log "AP radio switched to mt7925u (Wi-Fi 6E driver)"

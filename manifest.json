@@ -1,0 +1,55 @@
+{
+  "version": 0,
+  "name": "travelpi",
+  "content-security-policy": "default-src 'self'; base-uri 'self'; form-action 'self'; object-src 'none'; connect-src 'self' ws: wss:; script-src 'self'; script-src-attr 'none'; style-src 'self'; style-src-attr 'none'; img-src 'self'; font-src 'self'; frame-ancestors 'self'",
+  "menu": {
+    "travelpi": {
+      "label": "TravelPi",
+      "order": 30
+    }
+  },
+  "pages": {
+    "travelpi": {
+      "path": "index.html",
+      "label": "Router overview",
+      "menu": "travelpi",
+      "position": 10,
+      "order": 30
+    },
+    "travelpi/travelpi": {
+      "path": "travelpi.html",
+      "label": "Router overview",
+      "menu": "travelpi",
+      "position": 15,
+      "order": 30
+    },
+    "travelpi/hotel": {
+      "path": "hotel.html",
+      "label": "Hotel & privacy",
+      "menu": "travelpi",
+      "position": 20,
+      "order": 30
+    },
+    "travelpi/vpn": {
+      "path": "vpn.html",
+      "label": "Tunnels & devices",
+      "menu": "travelpi",
+      "position": 30,
+      "order": 30
+    },
+    "travelpi/network": {
+      "path": "network.html",
+      "label": "Network & shaping",
+      "menu": "travelpi",
+      "position": 40,
+      "order": 30
+    },
+    "travelpi/health": {
+      "path": "health.html",
+      "label": "Health & power",
+      "menu": "travelpi",
+      "position": 50,
+      "order": 30
+    }
+  }
+}

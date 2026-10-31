@@ -1,0 +1,14 @@
+[Unit]
+Description=TravelPi CPU power profile (cap ARM frequency for the 5V rail budget)
+After=sysinit.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# ondemand governor keeps burst response (tunnel crypto spikes) but the
+# 700 MHz cap lowers the voltage the rail must feed under sustained load.
+# The dashboard governor control persists to /etc/default/travelpi-power-profile.
+ExecStart=/bin/sh -c 'test -f /etc/default/travelpi-power-profile && . /etc/default/travelpi-power-profile; G=${GOVERNOR:-ondemand}; for d in /sys/devices/system/cpu/cpu*/cpufreq; do echo 700000 > "$d/scaling_max_freq"; echo "$G" > "$d/scaling_governor"; done'
+
+[Install]
+WantedBy=multi-user.target

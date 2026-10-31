@@ -1,0 +1,6 @@
+# Symmetric starting rate; the auto-tuner retunes each direction to 90% of
+# measured capacity (TRAVELPI_SQM_RATE = upload, TRAVELPI_SQM_RATE_DOWN =
+# download) and rewrites this file. Setting TRAVELPI_SQM_AUTOTUNE=no (what
+# the dashboard's rate control writes) pins the rates and disables auto-tune.
+TRAVELPI_SQM_RATE=12Mbit
+TRAVELPI_SQM_AUTOTUNE=yes

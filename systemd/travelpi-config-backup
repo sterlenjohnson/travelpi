@@ -1,0 +1,100 @@
+#!/bin/sh
+# TravelPi config backup (run daily by travelpi-config-backup.timer):
+# snapshots the hand-built config set to /var/lib/travelpi/backups so a
+# brownout-killed SD card means re-image + `make deploy` + `make restore`,
+# not archaeology. Pull copies off-device with `make backup-pull`.
+set -eu
+# Path/command overrides are test seams only: honored solely with TRAVELPI_TEST=1,
+# so a hostile environment can never pick a command or file used as root.
+[ "${TRAVELPI_TEST:-}" = 1 ] || unset TRAVELPI_BACKUP_DIR TRAVELPI_BACKUP_KEEP
+# The archive contains hotel PSKs (NetworkManager profiles, kept per ADR 0003:
+# a copy of the authoritative profiles, not a new store), the tailnet node
+# key, and the AdGuard admin hash. The archive is root-only (0600, umask 077
+# plus an explicit chmod below); the
+# directory stays listable (0755) because the filenames carry nothing but a
+# timestamp and `make backup-pull` must find the newest one as the login user.
+# Pulling a copy off-device therefore reads through `sudo cat`, with a
+# password in front of it on purpose.
+umask 077
+OUT=${TRAVELPI_BACKUP_DIR:-/var/lib/travelpi/backups}
+KEEP=${TRAVELPI_BACKUP_KEEP:-7}
+mkdir -p "$OUT"
+chmod 0755 "$OUT"
+STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+
+# Stage inside the backup dir (mktemp -d is 0700) rather than a shared /tmp,
+# and always clean up, including a half-written archive on failure.
+STAGE=$(mktemp -d "$OUT/.stage.XXXXXX")
+ARCHIVE=$OUT/config-$STAMP.tar.gz
+cleanup() {
+    rc=$?
+    rm -rf "$STAGE"
+    [ "$rc" -eq 0 ] || { rm -f "$ARCHIVE"; logger -t travelpi-config-backup "backup FAILED (exit $rc)" 2>/dev/null || :; }
+    exit "$rc"
+}
+trap cleanup EXIT
+trap 'exit 1' INT TERM
+mkdir -p "$STAGE/etc"
+# A missing AdGuard yaml is fine (not yet installed); other errors show in the journal.
+if [ -e /opt/adguardhome/conf/AdGuardHome.yaml ]; then
+    cat /opt/adguardhome/conf/AdGuardHome.yaml > "$STAGE/etc/travelpi-AdGuardHome.yaml"
+fi
+
+# gzip streams cannot be appended to (tar -r on a .tar.gz fails), so the staged
+# AdGuard yaml goes into the same single create invocation.
+# Paths below are relative to / and are the ONLY content `make restore` may
+# extract (it derives its allowlist from this block). One per line, no spaces
+# or glob characters. Paths that do not exist on this host are skipped by
+# --ignore-failed-read, so the list is the superset. Directories are archived
+# recursively. Keep the markers: tooling reads between them.
+# BEGIN BACKUP PATHS
+BACKUP_PATHS='
+etc/NetworkManager/system-connections
+etc/NetworkManager/NetworkManager.conf
+etc/hostapd/hostapd.conf
+etc/dnsmasq.d/travelpi.conf
+etc/unbound/unbound.conf.d/travelpi-front.conf
+etc/radvd.conf
+etc/travelpi
+etc/travelpi-home-dns
+etc/systemd/network/070-travelpi-ap.network
+etc/systemd/network/070-travelpi-ap.network.d
+etc/sysctl.d/90-travelpi-ipv6.conf
+etc/sudoers.d/travelpi-adguard
+etc/default/travelpi-sqm
+etc/default/travelpi-dns
+etc/default/travelpi-power-profile
+etc/containers/systemd/adguardhome.container
+etc/systemd/system/travelpi-sqm.service
+etc/systemd/system/travelpi-sqm-tune.service
+etc/systemd/system/travelpi-sqm-tune.timer
+etc/systemd/system/travelpi-radio-watch.service
+etc/systemd/system/travelpi-mem-watch.service
+etc/systemd/system/travelpi-power-profile.service
+etc/systemd/system/travelpi-power-record.service
+etc/systemd/system/wlan1-static-ip.service
+usr/local/libexec/travelpi-mem-watch
+usr/local/sbin/travelpi-sqm
+var/lib/tailscale
+'
+# END BACKUP PATHS
+
+# The staged AdGuard yaml (etc/travelpi-AdGuardHome.yaml, relative to the stage
+# dir) rides in the same create invocation and is restored by `make restore`
+# alongside the list above.
+# shellcheck disable=SC2086  # intentional word splitting of the path list
+# GNU tar exits 1 when a file changed while it was read (var/lib/tailscale is
+# live): the archive is still good, so that is a warning; >= 2 is fatal.
+tar_rc=0
+tar -czf "$ARCHIVE" --ignore-failed-read -C / $BACKUP_PATHS \
+    -C "$STAGE" etc/travelpi-AdGuardHome.yaml || tar_rc=$?
+if [ "$tar_rc" -eq 1 ]; then
+    logger -t travelpi-config-backup "WARN: tar reported files changed while read (exit 1); archive kept" 2>/dev/null || :
+elif [ "$tar_rc" -ge 2 ]; then
+    exit "$tar_rc"
+fi
+chmod 600 "$ARCHIVE"
+
+# Keep only the newest $KEEP archives.
+ls -t "$OUT"/config-*.tar.gz 2>/dev/null | tail -n +$((KEEP + 1)) | xargs -r rm -f
+logger -t travelpi-config-backup "config snapshot $STAMP ($(du -h "$ARCHIVE" | cut -f1))"

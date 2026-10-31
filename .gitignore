@@ -1,0 +1,25 @@
+__pycache__/
+node_modules/
+*.py[cod]
+dist/
+.DS_Store
+*.tar.gz
+*.log
+
+.opencode/*
+!.opencode/skills/
+.opencode/skills/*
+!.opencode/skills/harness2/
+.playwright-mcp/
+
+# local host notes and mount state (not published)
+harness/LongTermMEMORY.local.md
+harness/.mount-state.json
+
+# local-only files, secrets and editor state
+backups/
+*.local.md
+.env
+*.pem
+.vscode/
+.idea/

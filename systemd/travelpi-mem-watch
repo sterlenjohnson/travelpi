@@ -1,0 +1,100 @@
+#!/bin/sh
+# TravelPi memory/swap guard: act before the OOM freeze.
+#
+# A Pi Zero 2 W with swap full thrashes and freezes; the kernel OOM killer
+# arrives later and picks the wrong victim. This loop watches MemAvailable
+# and SwapFree and steps down a fixed ladder, one stage per pass, logging
+# every action to /var/lib/travelpi/mem-guard.jsonl:
+#   1. stop exim4 (a mail server the router never needed)
+#   2. stop adguardhome (the biggest non-core consumer; heal-restarted later)
+#   3. SIGKILL the largest process outside the core network/DNS/tunnel set
+# Recovery: when memory and swap stay healthy for 20 minutes, any service
+# this guard stopped is started again.
+set -u
+# Path/command overrides are test seams only: honored solely with TRAVELPI_TEST=1,
+# so a hostile environment can never pick a command or file used as root.
+[ "${TRAVELPI_TEST:-}" = 1 ] || unset TRAVELPI_STATE_DIR TRAVELPI_RUN_DIR TRAVELPI_MEMINFO
+# Path overrides exist so tests can run the loop against a sandbox; the
+# defaults are the production paths.
+STATE_DIR=${TRAVELPI_STATE_DIR:-/var/lib/travelpi}
+RUN_DIR=${TRAVELPI_RUN_DIR:-/run}
+MEMINFO=${TRAVELPI_MEMINFO:-/proc/meminfo}
+LOG=$STATE_DIR/mem-guard.jsonl
+HEARTBEAT=$STATE_DIR/mem-watch-heartbeat
+STOPPED_FLAG=$RUN_DIR/travelpi-mem-guard-stopped-adguard
+RECOVER_SINCE=$RUN_DIR/travelpi-mem-guard-recovery-since
+MEM_CRIT_MB=28
+SWAP_CRIT_MB=24
+RECOVER_MEM_MB=110
+RECOVER_SWAP_MB=80
+KILL_BUDGET_PER_HOUR=8
+# Core set: killing these breaks the router (AP, LAN DNS, resolver, tunnel,
+# management, or the guard's own plumbing). The kernel truncates comm to 15
+# characters, so names are listed (and compared) in truncated form:
+# systemd-journald -> systemd-journal, systemd-networkd -> systemd-network,
+# travelpi-cockpit -> travelpi-cockpi. ntpsec's daemon runs as "ntpd".
+PROTECTED='hostapd dnsmasq unbound NetworkManager wpa_supplicant tailscaled tailscale sshd sshd-session systemd systemd-journal systemd-udevd systemd-network systemd-logind systemd-resolve dbus-daemon cockpit-ws cockpit-session containerd podman travelpi-cockpi ntpd ntpsec rsyslogd sh'
+
+log_event() {
+    printf '{"ts":"%s","action":"%s","mem_avail_mb":%s,"swap_free_mb":%s,"detail":"%s"}\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$2" "$3" "$4" >> "$LOG"
+    logger -t travelpi-mem-watch "$1 mem_avail=$2MB swap_free=$3MB $4"
+}
+
+mem_avail() { awk '/^MemAvailable:/{print int($2/1024); exit}' "$MEMINFO"; }
+swap_free() { awk '/^SwapFree:/{print int($2/1024); exit}' "$MEMINFO"; }
+
+is_protected() {
+    c=$(printf '%.15s' "$1")
+    for p in $PROTECTED; do [ "$c" = "$(printf '%.15s' "$p")" ] && return 0; done
+    return 1
+}
+
+kill_budget_left() {
+    # Count kills logged in the last hour; cap runaway kill loops.
+    cutoff=$(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT00:00:00Z)
+    recent=$(awk -v c="$cutoff" -F'"' '/"action":"kill"/{if ($4 >= c) n++} END{print n+0}' "$LOG" 2>/dev/null)
+    [ "${recent:-0}" -lt "$KILL_BUDGET_PER_HOUR" ]
+}
+
+while :; do
+    touch "$HEARTBEAT"
+    MEM=$(mem_avail); SWAP=$(swap_free)
+    if [ "${MEM:-0}" -lt "$MEM_CRIT_MB" ] || [ "${SWAP:-0}" -lt "$SWAP_CRIT_MB" ]; then
+        rm -f "$RECOVER_SINCE"
+        if systemctl is-active --quiet exim4; then
+            systemctl stop exim4
+            log_event stop-exim4 "$MEM" "$SWAP" "stopped exim4 mail server under memory pressure"
+        elif systemctl is-active --quiet adguardhome; then
+            systemctl stop adguardhome
+            touch "$STOPPED_FLAG"
+            log_event stop-adguardhome "$MEM" "$SWAP" "stopped adguardhome to free memory"
+        elif kill_budget_left; then
+            VICTIM=$(ps -eo rss=,pid=,comm= --sort=-rss | \
+                awk -v prot="$PROTECTED" 'BEGIN{split(prot,a," ");for(i in a)p[substr(a[i],1,15)]=1}
+                    $3 !~ /^\[/ && !p[$3] && $2>2 {print $2, $1, $3; exit}')
+            if [ -z "$VICTIM" ]; then sleep 15; continue; fi
+            PID=$(echo "$VICTIM" | awk '{print $1}')
+            RSS=$(echo "$VICTIM" | awk '{print int($2/1024)}')
+            NAME=$(echo "$VICTIM" | awk '{print $3}' | tr -c 'A-Za-z0-9._:@+\n-' '_')
+            kill -9 "$PID" 2>/dev/null
+            log_event kill "$MEM" "$SWAP" "SIGKILL pid $PID ($NAME ${RSS}MB) outside protected set"
+        else
+            log_event pressure "$MEM" "$SWAP" "kill budget exhausted; holding"
+        fi
+    else
+        if [ "${MEM:-0}" -gt "$RECOVER_MEM_MB" ] && [ "${SWAP:-0}" -gt "$RECOVER_SWAP_MB" ]; then
+            [ -f "$RECOVER_SINCE" ] || date -u +%s > "$RECOVER_SINCE"
+            since=$(cat "$RECOVER_SINCE" 2>/dev/null || echo 0)
+            now=$(date -u +%s)
+            if [ -f "$STOPPED_FLAG" ] && [ $((now - since)) -ge 1200 ]; then
+                systemctl start adguardhome
+                rm -f "$STOPPED_FLAG" "$RECOVER_SINCE"
+                log_event heal-adguardhome "$MEM" "$SWAP" "memory healthy 20min; adguardhome restored"
+            fi
+        else
+            rm -f "$RECOVER_SINCE"
+        fi
+    fi
+    sleep 15
+done

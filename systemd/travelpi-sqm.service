@@ -1,0 +1,14 @@
+[Unit]
+Description=TravelPi CAKE SQM on the hotel WAN
+Wants=network-online.target
+After=NetworkManager-wait-online.service network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/default/travelpi-sqm
+ExecStart=/usr/local/sbin/travelpi-sqm start
+ExecStop=/usr/local/sbin/travelpi-sqm stop
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

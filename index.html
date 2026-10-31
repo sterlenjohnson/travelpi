@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light dark">
+    <title>TravelPi Cockpit</title>
+    <link rel="stylesheet" href="travelpi.css">
+  </head>
+  <body>
+    <main id="travelpi-app" class="app-shell" aria-busy="false">
+      <header class="app-header">
+        <div class="brand-lockup">
+          <span class="brand-mark" aria-hidden="true">TP</span>
+          <div>
+            <p class="eyebrow">TravelPi Cockpit</p>
+            <h1>Router overview</h1>
+          </div>
+        </div>
+        <div class="header-tools">
+          <span class="refresh-meta">Updated <time id="last-updated" datetime="">Not yet</time> <span id="freshness-state" class="muted">(not checked)</span></span>
+          <button id="refresh" class="button button-quiet" type="button">Refresh</button>
+        </div>
+      </header>
+
+      <div class="vitals-strip" aria-label="Vitals">
+        <span id="vitals-internet" class="vital-chip" data-state="neutral">Internet checking&hellip;</span>
+        <span id="vitals-ap" class="vital-chip" data-state="neutral">AP checking&hellip;</span>
+        <span id="vitals-dns" class="vital-chip" data-state="neutral">DNS checking&hellip;</span>
+        <span id="vitals-mem" class="vital-chip" data-state="neutral">Mem checking&hellip;</span>
+        <span id="vitals-power" class="vital-chip" data-state="neutral">Power checking&hellip;</span>
+      </div>
+      <p id="issue-banner" class="issue-banner" data-state="ok">Loading status&hellip;</p>
+
+      <p id="notice" class="notice" role="status" aria-live="polite">Waiting for the first status refresh.</p>
+
+      <details id="pending-bar" class="pending-bar" hidden open aria-labelledby="pending-title" aria-live="polite">
+        <summary class="pending-summary">
+          <span class="pending-copy">
+            <span class="eyebrow" id="pending-title">Pending changes</span>
+            <strong id="pending-summary">None</strong>
+          </span>
+          <span class="summary-meta">Show or hide</span>
+        </summary>
+        <div class="pending-content">
+          <p id="pending-hint" class="pending-hint">Nothing has been applied yet.</p>
+          <ul id="pending-list" class="pending-list"></ul>
+          <div class="button-row">
+            <button id="apply-pending" class="button button-primary" type="button">Apply Changes</button>
+            <button id="rollback-pending" class="button button-secondary" type="button">Rollback Pending</button>
+          </div>
+        </div>
+      </details>
+
+      <section class="topo" aria-label="Internet topology">
+        <div class="topo-node">
+          <span class="topo-icon" id="topo-wan-icon" data-state="neutral" aria-hidden="true">🌐</span>
+          <strong id="topo-wan-label">Internet</strong>
+          <small id="topo-wan-detail">&mdash;</small>
+        </div>
+        <span class="topo-line" id="topo-line-wan" data-state="neutral" aria-hidden="true"></span>
+        <div class="topo-node">
+          <span class="topo-icon" aria-hidden="true">📡</span>
+          <strong>TravelPi</strong>
+          <small id="topo-ap-detail">TravelPi</small>
+        </div>
+        <span class="topo-line" id="topo-line-lan" data-state="neutral" aria-hidden="true"></span>
+        <div class="topo-node">
+          <span class="topo-icon" aria-hidden="true">💻</span>
+          <strong id="topo-clients-label">0 Clients</strong>
+          <small id="topo-clients-detail">192.168.200.1</small>
+        </div>
+      </section>
+
+      <section class="dashboard-grid" aria-label="Router status">
+        <article id="internet-card" class="feature-card feature-card-internet">
+          <header class="card-header">
+            <div>
+              <p class="eyebrow">Hotel Wi-Fi (WAN)</p>
+              <h2>Preferred uplink</h2>
+            </div>
+            <span id="wan-chip" class="status-badge status-badge-neutral"><span id="wan-chip-dot" class="badge-dot" aria-hidden="true"></span><span id="wan-chip-text">Unknown</span></span>
+          </header>
+          <div class="primary-status">
+            <div>
+              <strong id="preferred-wan-label">Hotel Wi-Fi (WAN)</strong>
+              <span id="preferred-wan-interface" class="interface-secondary">wlan0</span>
+              <small id="wan-hardware" class="hardware-label">Hardware not detected</small>
+            </div>
+            <span id="wan-ssid" class="primary-subvalue">&mdash;</span>
+          </div>
+          <dl class="mini-stats mini-stats-four">
+            <div><dt>Address</dt><dd id="wan-address">&mdash;</dd></div>
+            <div><dt>Signal</dt><dd><span id="wan-signal-bars" class="signal-bars" aria-label="WAN signal strength"><span></span><span></span><span></span><span></span></span> <span id="wan-signal">&mdash;</span> <span id="spark-signal" class="spark" title="recent signal trend"></span></dd></div>
+            <div><dt>Gateway</dt><dd id="wan-gateway">&mdash;</dd></div>
+            <div><dt>State</dt><dd id="wan-state">Unknown</dd></div>
+          </dl>
+          <div class="card-action-line probe-action-line">
+            <label class="probe-target-label" for="probe-target">Target</label>
+            <input id="probe-target" class="probe-target-input" type="text" value="google.com" placeholder="domain or IP" autocomplete="off" spellcheck="false" />
+            <button id="probe-wan" class="button button-secondary" type="button">Probe</button>
+            <div class="probe-status" aria-live="polite">
+              <span class="eyebrow">WAN probe</span>
+              <strong id="wan-probe-status" data-state="neutral">Not checked</strong>
+              <span id="wan-probe-detail" class="action-note">Fixed HTTP check from the Pi via wlan0.</span>
+              <span id="wan-quality-history" class="quality-history" aria-live="polite">Quality history: no samples.</span>
+            </div>
+          </div>
+          <p class="card-action-line"><a class="text-link" href="/travelpi/hotel">Connect to hotel Wi-Fi, MAC privacy &rarr;</a></p>
+        </article>
+
+        <article id="private-card" class="feature-card feature-card-private">
+          <header class="card-header">
+            <div>
+              <p class="eyebrow">TravelPi Wi-Fi (AP)</p>
+              <h2>Private access point</h2>
+            </div>
+            <span id="ap-chip" class="status-badge status-badge-neutral"><span id="ap-chip-text">Unknown</span></span>
+          </header>
+          <div class="primary-status">
+            <div>
+              <strong id="ap-band">2.4 GHz</strong>
+              <span id="ap-interface" class="interface-secondary">wlan1</span>
+              <small id="ap-hardware" class="hardware-label">Hardware not detected</small>
+            </div>
+            <span id="ap-ssid" class="primary-subvalue">&mdash;</span>
+          </div>
+          <dl class="mini-stats mini-stats-three">
+            <div><dt>Channel</dt><dd id="ap-channel">&mdash;</dd></div>
+            <div><dt>Clients</dt><dd id="ap-clients">&mdash;</dd></div>
+            <div><dt>Wi-Fi 6</dt><dd id="ap-wifi6">&mdash;</dd></div>
+          </dl>
+          <div class="card-action-line">
+            <label class="switch-control"><input id="ap-enabled-toggle" type="checkbox" disabled checked><span>AP ON</span></label>
+            <button id="view-clients" class="button button-secondary" type="button" aria-controls="clients-details" aria-expanded="false">View clients</button>
+            <button id="ap-switch-5ghz" class="button button-secondary" type="button" data-band="5ghz" title="One-click: AP → 5 GHz / Wi-Fi 6">5 GHz</button>
+            <button id="ap-switch-2ghz" class="button button-secondary" type="button" data-band="2.4ghz" title="One-click: AP → 2.4 GHz">2.4 GHz</button>
+            <a class="text-link" href="/travelpi/vpn">Secure tunnels &rarr;</a>
+            <a class="text-link" href="/travelpi/network#advanced">Network &amp; shaping &rarr;</a>
+            <a class="text-link" href="/travelpi/health">Health &amp; power &rarr;</a>
+            <span id="ap-state" class="action-note">State unknown</span>
+          </div>
+        </article>
+      </section>
+
+      <details id="clients-details" class="disclosure-block clients-block" open>
+        <summary><span><span class="eyebrow">TravelPi Wi-Fi (AP)</span><strong>Connected devices</strong></span><span id="client-summary" class="summary-meta">0 clients</span></summary>
+        <div class="disclosure-content">
+          <p class="section-note">Read-only from the local helper; no network scan. A <strong>Private MAC</strong> badge means the address is randomized: phones often use a random MAC per network.</p>
+          <div class="table-wrap">
+            <table class="client-table">
+              <caption class="sr-only">Connected TravelPi Wi-Fi clients</caption>
+              <thead><tr><th scope="col">Device</th><th scope="col">IP</th><th scope="col">MAC</th><th scope="col">Signal</th><th scope="col">Rates</th></tr></thead>
+              <tbody id="client-rows"><tr><td colspan="5" class="muted">No client data yet.</td></tr></tbody>
+            </table>
+          </div>
+        </div>
+      </details>
+
+      <dialog id="confirm-dialog" aria-labelledby="confirm-title" aria-describedby="confirm-message">
+        <div class="dialog-content">
+          <p class="eyebrow">Confirm action</p>
+          <h2 id="confirm-title">Are you sure?</h2>
+          <p id="confirm-message">This action may interrupt the router. Do you want to continue?</p>
+          <div class="dialog-actions">
+            <button id="confirm-cancel" class="button button-secondary" type="button" value="cancel">Cancel</button>
+            <button id="confirm-accept" class="button button-danger" type="button" value="accept">Confirm</button>
+          </div>
+        </div>
+      </dialog>
+    </main>
+
+    <noscript><p class="no-script">TravelPi requires JavaScript to read status from Cockpit.</p></noscript>
+    <script src="../base1/cockpit.js" defer></script>
+    <script src="travelpi-mutations.js" defer></script>
+    <script src="travelpi-typed.js" defer></script>
+    <script src="travelpi.js" defer></script>
+  </body>
+</html>

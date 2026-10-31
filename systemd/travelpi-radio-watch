@@ -1,0 +1,118 @@
+#!/bin/sh
+# TravelPi radio auto-recovery watchdog.
+# The MT7921U USB AP radio can flap into a stuck NO-CARRIER state that hostapd
+# alone never recovers from (2026-10-27: a day of link failures with the AP
+# unit "active" and no carrier). This watchdog watches the carrier of the
+# interface hostapd is configured to use and escalates when it stays down:
+#   1) link cycle (ip link down/up)
+#   2) USB unbind/bind of the adapter (power-cycle the stick)
+#   3) hostapd restart
+# Recovery events are appended to /var/lib/travelpi/radio-recoveries.jsonl and
+# a heartbeat file is touched on every loop, so the Cockpit can show watchdog
+# liveness, recovery count, and the last recovery time.
+set -u
+# Path/command overrides are test seams only: honored solely with TRAVELPI_TEST=1,
+# so a hostile environment can never pick a command or file used as root.
+[ "${TRAVELPI_TEST:-}" = 1 ] || unset TRAVELPI_STATE_DIR TRAVELPI_SYS_ROOT TRAVELPI_HOSTAPD_CONF TRAVELPI_PROC_UPTIME TRAVELPI_RADIO_WATCH_RUN
+# Path overrides exist so tests can run the loop against a sandbox; the
+# defaults are the production paths.
+STATE_DIR=${TRAVELPI_STATE_DIR:-/var/lib/travelpi}
+SYS=${TRAVELPI_SYS_ROOT:-/sys}
+HOSTAPD_CONF=${TRAVELPI_HOSTAPD_CONF:-/etc/hostapd/hostapd.conf}
+PROC_UPTIME=${TRAVELPI_PROC_UPTIME:-/proc/uptime}
+LOG=$STATE_DIR/radio-recoveries.jsonl
+HEARTBEAT=$STATE_DIR/radio-watch-heartbeat
+# Private state (streak, last-recovery uptime) lives under /run, root-only:
+# a fixed /tmp path written as root can be pre-created as a symlink.
+RUN_DIR=${TRAVELPI_RADIO_WATCH_RUN:-/run/travelpi-radio-watch}
+STREAK_FILE=$RUN_DIR/streak
+LAST_FILE=$RUN_DIR/last-recovery-uptime
+DOWN_LIMIT=2      # consecutive no-carrier checks (~30s) before escalating
+COOLDOWN=180      # seconds between recovery attempts
+
+iface() {
+    awk -F= '/^interface=/{print $2; exit}' "$HOSTAPD_CONF" 2>/dev/null
+}
+
+carrier() {
+    cat "$SYS/class/net/$1/carrier" 2>/dev/null || echo x
+}
+
+usb_path() {
+    # /sys/class/net/wlan1/device resolves to .../usb1/1-1/1-1.2/1-1.2:1.0;
+    # the unbind/bind target is the device node without the interface suffix.
+    dev=$(readlink -f "$SYS/class/net/$1/device" 2>/dev/null) || return 1
+    [ -n "$dev" ] || return 1
+    phys=$(basename "$dev")
+    phys=${phys%%:*}
+    [ -e "$SYS/bus/usb/drivers/usb/$phys" ] || return 1
+    echo "$phys"
+}
+
+record() {
+    printf '{"ts": %s, "outcome": "%s"}\n' "$(date +%s)" "$1" >> "$LOG"
+    logger -t travelpi-radio-watch "recovery outcome: $1"
+}
+
+recover() {
+    i=$1
+    touch "$HEARTBEAT"
+    logger -t travelpi-radio-watch "recovery: link cycle on $i"
+    ip link set "$i" down 2>/dev/null
+    sleep 2
+    ip link set "$i" up 2>/dev/null
+    sleep 10
+    touch "$HEARTBEAT"
+    if [ "$(carrier "$i")" = 1 ]; then record link-cycle; return 0; fi
+    phys=$(usb_path "$i")
+    if [ -n "$phys" ]; then
+        logger -t travelpi-radio-watch "recovery: usb rebind $phys"
+        echo "$phys" > "$SYS/bus/usb/drivers/usb/unbind" 2>/dev/null
+        sleep 3
+        echo "$phys" > "$SYS/bus/usb/drivers/usb/bind" 2>/dev/null
+        sleep 12
+        touch "$HEARTBEAT"
+        if [ "$(carrier "$i")" = 1 ]; then record usb-rebind; return 0; fi
+    fi
+    logger -t travelpi-radio-watch "recovery: hostapd restart"
+    systemctl restart --no-block hostapd 2>/dev/null
+    sleep 8
+    touch "$HEARTBEAT"
+    if [ "$(carrier "$i")" = 1 ]; then record hostapd-restart; return 0
+    else record stalled; return 0
+    fi
+}
+
+uptime_s() { awk '{print int($1)}' "$PROC_UPTIME" 2>/dev/null || echo 0; }
+
+mkdir -p "$STATE_DIR"
+install -d -m 0700 "$RUN_DIR" || exit 1
+while :; do
+    touch "$HEARTBEAT"
+    i=$(iface)
+    streak=0
+    [ -f "$STREAK_FILE" ] && [ ! -L "$STREAK_FILE" ] && streak=$(cat "$STREAK_FILE" 2>/dev/null || echo 0)
+    case $streak in ''|*[!0-9]*) streak=0 ;; esac
+    if [ -n "$i" ] && [ -e "$SYS/class/net/$i" ]; then
+        if [ "$(carrier "$i")" = 1 ]; then
+            [ "$streak" != 0 ] && echo 0 > "$STREAK_FILE"
+        else
+            streak=$((streak + 1))
+            echo "$streak" > "$STREAK_FILE"
+            # Cooldown runs on /proc/uptime: the Pi has no RTC, so wall-clock
+            # time can jump (NTP step) right after boot. The recovery log keeps
+            # wall-clock ts for the helper; the cooldown never reads it.
+            now=$(uptime_s)
+            last=
+            [ -f "$LAST_FILE" ] && [ ! -L "$LAST_FILE" ] && last=$(cat "$LAST_FILE" 2>/dev/null)
+            case $last in ''|*[!0-9]*) last= ;; esac
+            if [ "$streak" -ge "$DOWN_LIMIT" ] && { [ -z "$last" ] || [ $((now - last)) -ge "$COOLDOWN" ]; }; then
+                logger -t travelpi-radio-watch "carrier down ${streak}x on $i, escalating"
+                recover "$i"
+                uptime_s > "$LAST_FILE"
+                echo 0 > "$STREAK_FILE"
+            fi
+        fi
+    fi
+    sleep 15
+done

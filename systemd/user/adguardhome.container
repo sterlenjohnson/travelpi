@@ -1,0 +1,27 @@
+[Unit]
+Description=AdGuard Home DNS and web service
+Wants=network-online.target
+After=network-online.target
+
+[Container]
+Image=docker.io/adguard/adguardhome:latest
+ContainerName=adguardhome
+Network=host
+Entrypoint=/opt/adguardhome/AdGuardHome
+Exec=--no-check-update -c /opt/adguardhome/conf/AdGuardHome.yaml -w /opt/adguardhome/work
+Volume=/opt/adguardhome/conf:/opt/adguardhome/conf:Z
+Volume=/opt/adguardhome/work:/opt/adguardhome/work:Z
+Volume=travelpi-adguard-stats:/opt/adguardhome/work/stats
+Environment=HOME=/opt/adguardhome
+AutoUpdate=local
+
+[Service]
+Restart=always
+RestartSec=10
+MemoryMax=192M
+TasksMax=128
+TimeoutStartSec=300
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,8 @@
+[Unit]
+Description=TravelPi SQM auto-tune (measure link, retune CAKE)
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/travelpi-sqm-autotune
+Nice=10

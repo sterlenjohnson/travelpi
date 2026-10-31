@@ -1,0 +1,11 @@
+[Unit]
+Description=TravelPi SQM auto-tune every 4 hours
+
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec=4h
+RandomizedDelaySec=300
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

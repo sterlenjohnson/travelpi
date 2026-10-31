@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light dark">
+    <title>TravelPi Health</title>
+    <link rel="stylesheet" href="travelpi.css">
+  </head>
+  <body>
+    <main id="travelpi-app" class="app-shell" aria-busy="false">
+      <header class="app-header">
+        <div class="brand-lockup">
+          <span class="brand-mark" aria-hidden="true">TP</span>
+          <div>
+            <p class="eyebrow">TravelPi Cockpit</p>
+            <h1>Health &amp; power</h1>
+          </div>
+        </div>
+        <div class="header-tools">
+          <span class="refresh-meta">Updated <time id="last-updated" datetime="">Not yet</time> <span id="freshness-state" class="muted">(not checked)</span></span>
+          <button id="refresh" class="button button-quiet" type="button">Refresh</button>
+        </div>
+      </header>
+
+      <div class="vitals-strip" aria-label="Vitals">
+        <span id="vitals-internet" class="vital-chip" data-state="neutral">Internet checking&hellip;</span>
+        <span id="vitals-ap" class="vital-chip" data-state="neutral">AP checking&hellip;</span>
+        <span id="vitals-dns" class="vital-chip" data-state="neutral">DNS checking&hellip;</span>
+        <span id="vitals-mem" class="vital-chip" data-state="neutral">Mem checking&hellip;</span>
+        <span id="vitals-power" class="vital-chip" data-state="neutral">Power checking&hellip;</span>
+      </div>
+      <p id="issue-banner" class="issue-banner" data-state="ok">Loading status&hellip;</p>
+
+      <p id="notice" class="notice" role="status" aria-live="polite">Waiting for the first status refresh.</p>
+
+      <details id="pending-bar" class="pending-bar" hidden open aria-labelledby="pending-title" aria-live="polite">
+        <summary class="pending-summary">
+          <span class="pending-copy">
+            <span class="eyebrow" id="pending-title">Pending changes</span>
+            <strong id="pending-summary">None</strong>
+          </span>
+          <span class="summary-meta">Show or hide</span>
+        </summary>
+        <div class="pending-content">
+          <p id="pending-hint" class="pending-hint">Nothing has been applied yet.</p>
+          <ul id="pending-list" class="pending-list"></ul>
+          <div class="button-row">
+            <button id="apply-pending" class="button button-primary" type="button">Apply Changes</button>
+            <button id="rollback-pending" class="button button-secondary" type="button">Rollback Pending</button>
+          </div>
+        </div>
+      </details>
+
+      <section id="quick-settings" class="section-block" aria-labelledby="quick-settings-heading">
+        <article class="wide-card quick-settings-card">
+          <header class="card-header">
+            <div>
+              <p class="eyebrow">Quick Settings</p>
+              <h2 id="quick-settings-heading">Pi health, memory and power</h2>
+            </div>
+            <span id="quick-settings-chip" class="status-badge status-badge-neutral">Read-only checks</span>
+          </header>
+          <p class="compact-copy">Temperature, load, swap, and power-throttle flags help diagnose instability. Memory actions never stop services.</p>
+          <div class="quick-settings-grid">
+            <article class="quick-setting-card">
+              <div class="quick-setting-heading"><h3>Pi health</h3><span id="quick-health-chip" class="status-badge status-badge-neutral">Unknown</span></div>
+              <strong id="quick-health-state">Checking&hellip;</strong>
+              <p id="quick-health-detail" class="compact-copy">Temperature, load, swap, and power-throttle flags help diagnose instability.</p>
+              <p id="quick-memory-detail" class="compact-copy">Memory not reported.</p>
+
+              <div class="governor-control">
+                <label for="governor-slider">CPU governor</label>
+                <input id="governor-slider" type="range" min="0" max="2" step="1" value="1" list="governor-marks" aria-describedby="quick-governor-state">
+                <datalist id="governor-marks">
+                  <option value="0" label="conservative"></option>
+                  <option value="1" label="ondemand"></option>
+                  <option value="2" label="performance"></option>
+                </datalist>
+                <span id="quick-governor-state" class="action-note">Governor unknown</span>
+              </div>
+
+              <div class="power-indicator">
+                <p id="quick-power-state">Checking&hellip;</p>
+                <span id="quick-power-chip" class="status-badge status-badge-neutral">Unknown</span>
+              </div>
+              <p id="quick-power-detail" class="compact-copy">Power: core voltage, current draw, and throttle flags for the Pi Zero 2 W dual-supply setup.</p>
+              <span id="spark-temp" class="spark" title="temperature history"></span>
+              <div class="button-row">
+                <button id="reclaim-memory" class="button button-secondary" type="button" data-action="reclaim_memory">Clear caches (RAM)</button>
+              </div>
+            </article>
+          </div>
+        </article>
+      </section>
+
+      <article class="service-card">
+        <div>
+          <p class="eyebrow">Operations</p>
+          <h3>Service actions</h3>
+          <span id="cake-enabled-toggle" class="status-badge status-badge-neutral service-health-badge">CAKE / SQM</span>
+          <p class="control-help">Each action uses the existing fixed helper target and needs explicit confirmation.</p>
+        </div>
+        <dl class="service-status-list">
+          <div><dt>hostapd</dt><dd id="service-hostapd">Unknown</dd></div>
+          <div><dt>dnsmasq</dt><dd id="service-dnsmasq">Unknown</dd></div>
+          <div><dt>SQM service</dt><dd id="service-sqm">Unknown</dd></div>
+          <div><dt>CAKE qdisc</dt><dd id="cake-kind">&mdash;</dd></div>
+          <div><dt>Rate &middot; mode</dt><dd id="cake-rate">&mdash;</dd></div>
+        </dl>
+        <div class="button-row">
+          <button class="button button-secondary" type="button" data-action="restart_services" data-target="ap">Restart AP</button>
+          <button class="button button-secondary" type="button" data-action="restart_services" data-target="sqm">Restart SQM</button>
+          <button class="button button-danger" type="button" data-action="reboot">Reboot TravelPi</button>
+        </div>
+      </article>
+
+      <p class="card-action-line">
+        <a class="text-link" href="/travelpi/">&larr; Router overview</a>
+        <a class="text-link" href="/travelpi/network">Network &amp; shaping &rarr;</a>
+      </p>
+
+      <dialog id="confirm-dialog" aria-labelledby="confirm-title" aria-describedby="confirm-message">
+        <div class="dialog-content">
+          <p class="eyebrow">Confirm action</p>
+          <h2 id="confirm-title">Are you sure?</h2>
+          <p id="confirm-message">This action may interrupt the router. Do you want to continue?</p>
+          <div class="dialog-actions">
+            <button id="confirm-cancel" class="button button-secondary" type="button" value="cancel">Cancel</button>
+            <button id="confirm-accept" class="button button-danger" type="button" value="accept">Confirm</button>
+          </div>
+        </div>
+      </dialog>
+    </main>
+
+    <noscript><p class="no-script">TravelPi requires JavaScript to read status from Cockpit.</p></noscript>
+    <script src="../base1/cockpit.js" defer></script>
+    <script src="travelpi-mutations.js" defer></script>
+    <script src="travelpi-typed.js" defer></script>
+    <script src="travelpi.js" defer></script>
+  </body>
+</html>

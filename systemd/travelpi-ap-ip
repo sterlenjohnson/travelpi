@@ -1,0 +1,110 @@
+#!/bin/sh
+# TravelPi AP address keeper: assigns and keeps the TravelPi AP addresses on
+# the radio hostapd is using (kept dynamic for a radio role swap). Watch mode
+# re-applies every 15s: a USB radio flap re-creates the interface with no
+# address, and the 2026-10-27 incident showed a boot-time oneshot leaves AP
+# clients without DNS (192.168.200.1) until reboot.
+#
+# 2026-10-30 ULA incident: a plain "ip addr flush" wiped the interface's
+# IPv6 link-local address, and the kernel regenerates link-local only on an
+# admin state change, never after a flush. radvd's router advertisements
+# must be sourced from a link-local address (RFC 4861), so every RA was
+# invalid and LAN clients never received a ULA address (the per-install /64 in
+# /etc/travelpi/ula-prefix). Flushes here are IPv4-scoped, the AP's gateway address in the
+# advertised ULA prefix is applied explicitly, and a missing link-local is
+# recovered with the disable_ipv6 1->0 toggle (the kernel regenerates
+# link-local on the enable edge; the toggle also wipes v6 globals, so it
+# runs before the global add). The keeper never restarts systemd-networkd:
+# a networkd restart flushes unowned addresses, and a keeper-triggered
+# restart on every address-missing tick oscillated the AP every 15 s
+# (2026-10-30; networkd owns the AP addresses via Address= in
+# 070-travelpi-ap.network and re-advertises RAs on netlink link events).
+# radvd is only legacy try-restart here (inactive no-op on networkd hosts).
+set -u
+# Path/command overrides are test seams only: honored solely with TRAVELPI_TEST=1,
+# so a hostile environment can never pick a command or file used as root.
+[ "${TRAVELPI_TEST:-}" = 1 ] || unset TRAVELPI_IP TRAVELPI_SYSTEMCTL TRAVELPI_NMCLI TRAVELPI_HOSTAPD_CONF TRAVELPI_SYS_ROOT
+AP_V4="192.168.200.1/24"
+# Path overrides exist so tests can run the keeper against a sandbox with
+# shimmed tools; the defaults are the production paths.
+IP="${TRAVELPI_IP:-/sbin/ip}"
+SYSTEMCTL="${TRAVELPI_SYSTEMCTL:-/bin/systemctl}"
+NMCLI="${TRAVELPI_NMCLI:-/usr/bin/nmcli}"
+HOSTAPD_CONF="${TRAVELPI_HOSTAPD_CONF:-/etc/hostapd/hostapd.conf}"
+SYS_NET="${TRAVELPI_SYS_ROOT:-/sys}/class/net"
+ULA_PREFIX_FILE="${TRAVELPI_ULA_PREFIX_FILE:-/etc/travelpi/ula-prefix}"
+AP_V6=""
+# The ULA gateway is the ::1 address of the /64 in the prefix file. No valid
+# prefix means no ULA is configured: the keeper then manages IPv4 only and
+# never invents an address.
+load_ula() {
+    AP_V6=""
+    prefix=$(head -n 1 "$ULA_PREFIX_FILE" 2>/dev/null | tr -d ' \t\r')
+    if printf '%s\n' "$prefix" | grep -Eq '^fd[0-9a-f]{2}:[0-9a-f]{1,4}:[0-9a-f]{1,4}:[0-9a-f]{1,4}::/64$'; then
+        AP_V6="${prefix%::/64}::1/64"
+    fi
+}
+
+ensure_link_local() {
+    if ! ip -6 addr show dev "$1" scope link 2>/dev/null | grep -q "fe80::"; then
+        sysctl -qw "net.ipv6.conf.$1.disable_ipv6=1" >/dev/null 2>&1 || true
+        sysctl -qw "net.ipv6.conf.$1.disable_ipv6=0" >/dev/null 2>&1 || true
+        # Only report a toggle when it actually produced a link-local address;
+        # a failed sysctl must not be logged as "regenerated".
+        if ip -6 addr show dev "$1" scope link 2>/dev/null | grep -q "fe80::"; then
+            echo toggled
+        fi
+    fi
+}
+
+apply() {
+    load_ula
+    iface=$(awk -F= '/^interface=/{print $2; exit}' "$HOSTAPD_CONF" 2>/dev/null)
+    [ -n "$iface" ] || return 0
+    [ -e "$SYS_NET/$iface" ] || return 0
+    "$NMCLI" device set "$iface" managed no >/dev/null 2>&1 || true
+    if ip -4 addr show dev "$iface" 2>/dev/null | grep -q "192.168.200.1/"; then
+        v4_ok=1
+    else
+        v4_ok=0
+    fi
+    if [ -z "$AP_V6" ]; then
+        v6_ok=1
+    elif ip -6 addr show dev "$iface" scope global 2>/dev/null | grep -q "${AP_V6%/64}/"; then
+        v6_ok=1
+    else
+        v6_ok=0
+    fi
+    if [ "$v4_ok" = 1 ] && [ "$v6_ok" = 1 ]; then
+        toggled=$(ensure_link_local "$iface")
+        if [ "$toggled" = toggled ]; then
+            # The disable_ipv6 toggle wipes v6 globals; re-apply the gateway
+            # the toggle just removed (header rule: toggle before the global add).
+            if [ -n "$AP_V6" ]; then
+                "$IP" -6 addr add "$AP_V6" dev "$iface" 2>/dev/null || true
+            fi
+            "$SYSTEMCTL" try-restart radvd >/dev/null 2>&1 || true
+            logger -t travelpi-ap-ip "link-local regenerated on $iface; gateway re-applied; legacy RA daemon restarted"
+        fi
+        return 0
+    fi
+    "$IP" link set "$iface" up
+    if [ "$v4_ok" = 0 ]; then
+        "$IP" -4 addr flush dev "$iface" 2>/dev/null || true
+        "$IP" addr add "$AP_V4" dev "$iface"
+    fi
+    if [ "$v6_ok" = 0 ]; then
+        ensure_link_local "$iface" >/dev/null
+        "$IP" -6 addr add "$AP_V6" dev "$iface" 2>/dev/null || true
+        "$SYSTEMCTL" try-restart radvd >/dev/null 2>&1 || true
+    fi
+    logger -t travelpi-ap-ip "AP addresses applied to $iface (v4 $AP_V4, v6 gateway ${AP_V6:-not configured})"
+}
+
+if [ "${1:-}" = watch ]; then
+    while true; do
+        apply || true
+        sleep 15
+    done
+fi
+apply

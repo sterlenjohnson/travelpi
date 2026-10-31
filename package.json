@@ -1,0 +1,20 @@
+{
+  "name": "travelpi-cockpit",
+  "version": "0.1.0",
+  "description": "A static Cockpit package and allowlisted helper that turns a Raspberry Pi into a travel/hotel Wi-Fi router.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sterlenjohnson/travelpi.git"
+  },
+  "homepage": "https://github.com/sterlenjohnson/travelpi",
+  "private": true,
+  "scripts": {
+    "typecheck": "tsc --project tsconfig.json",
+    "build:app": "tsc --project tsconfig.app.json && cp dist/app/travelpi.js travelpi.js",
+    "build:runtime": "tsc --project tsconfig.runtime.json && cp dist/runtime/travelpi-projection.js travelpi-typed.js"
+  },
+  "devDependencies": {
+    "typescript": "^7.0.2"
+  }
+}

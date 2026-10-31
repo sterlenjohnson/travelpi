@@ -1,0 +1,66 @@
+#!/bin/sh
+# TravelPi ULA prefix owner. The AP's IPv6 prefix lives in ONE file,
+# /etc/travelpi/ula-prefix (override: TRAVELPI_ULA_PREFIX_FILE): a single
+# line holding a /64 such as fd12:3456:789a:1::/64. Every consumer (the
+# networkd .network file, the AP keeper, the helper) reads that file.
+#
+#   travelpi-ula-init                      ensure the file exists, print the prefix
+#   travelpi-ula-init render TEMPLATE OUT  render @ULA_PREFIX@ / @ULA_GATEWAY@
+#
+# If the file is absent: (1) migrate the ULA prefix an already-installed
+# networkd AP profile advertises (TRAVELPI_NETWORK_FILE, default
+# /etc/systemd/network/070-travelpi-ap.network) so a live router keeps its
+# addressing; (2) otherwise generate an RFC 4193 prefix, fd + 40 random bits,
+# subnet id 1. An existing file is never overwritten; a malformed one is
+# refused (exit 1) rather than repaired.
+set -u
+# Path/command overrides are test seams only: honored solely with TRAVELPI_TEST=1,
+# so a hostile environment can never pick a command or file used as root.
+[ "${TRAVELPI_TEST:-}" = 1 ] || unset TRAVELPI_NETWORK_FILE TRAVELPI_RANDOM_SOURCE
+PREFIX_FILE="${TRAVELPI_ULA_PREFIX_FILE:-/etc/travelpi/ula-prefix}"
+NETWORK_FILE="${TRAVELPI_NETWORK_FILE:-/etc/systemd/network/070-travelpi-ap.network}"
+RANDOM_SOURCE="${TRAVELPI_RANDOM_SOURCE:-/dev/urandom}"
+# fdXX:XXXX:XXXX:SUBNET::/64, lowercase hex, RFC 4193 locally assigned (fd00::/8).
+VALID='^fd[0-9a-f]{2}:[0-9a-f]{1,4}:[0-9a-f]{1,4}:[0-9a-f]{1,4}::/64$'
+
+valid() { printf '%s\n' "$1" | grep -Eq "$VALID"; }
+
+if [ "${1:-}" = render ]; then
+    [ $# -eq 3 ] || { echo "usage: $0 render TEMPLATE OUT" >&2; exit 2; }
+    [ -f "$2" ] || { echo "travelpi-ula-init: template $2 not found" >&2; exit 1; }
+    [ -f "$PREFIX_FILE" ] || { echo "travelpi-ula-init: $PREFIX_FILE missing; run travelpi-ula-init first" >&2; exit 1; }
+    prefix=$(head -n 1 "$PREFIX_FILE" | tr -d ' \t\r')
+    valid "$prefix" || { echo "travelpi-ula-init: $PREFIX_FILE does not hold a valid ULA /64" >&2; exit 1; }
+    gateway="${prefix%::/64}::1/64"
+    tmp="$3.tmp.$$"
+    sed -e "s|@ULA_PREFIX@|$prefix|g" -e "s|@ULA_GATEWAY@|$gateway|g" "$2" > "$tmp" \
+        && chmod 0644 "$tmp" && mv "$tmp" "$3" || { rm -f "$tmp"; exit 1; }
+    exit 0
+fi
+
+if [ -e "$PREFIX_FILE" ]; then
+    prefix=$(head -n 1 "$PREFIX_FILE" | tr -d ' \t\r')
+    valid "$prefix" || { echo "travelpi-ula-init: $PREFIX_FILE is not a valid ULA /64 (want e.g. fd12:3456:789a:1::/64); refusing to overwrite it" >&2; exit 1; }
+    printf '%s\n' "$prefix"
+    exit 0
+fi
+
+prefix=""
+if [ -f "$NETWORK_FILE" ]; then
+    old=$(sed -n 's/^Prefix=[[:space:]]*//p' "$NETWORK_FILE" | head -n 1 | tr -d ' \t\r')
+    if [ -n "$old" ] && valid "$old"; then
+        prefix="$old"
+        echo "travelpi-ula-init: migrated the live AP prefix $prefix from $NETWORK_FILE" >&2
+    fi
+fi
+if [ -z "$prefix" ]; then
+    bits=$(od -An -N5 -tx1 "$RANDOM_SOURCE" 2>/dev/null | tr -d ' \n')
+    [ "${#bits}" -eq 10 ] || { echo "travelpi-ula-init: could not read random bits from $RANDOM_SOURCE" >&2; exit 1; }
+    prefix="fd$(printf '%s' "$bits" | cut -c1-2):$(printf '%s' "$bits" | cut -c3-6):$(printf '%s' "$bits" | cut -c7-10):1::/64"
+    valid "$prefix" || { echo "travelpi-ula-init: generated prefix $prefix is malformed" >&2; exit 1; }
+    echo "travelpi-ula-init: generated RFC 4193 prefix $prefix" >&2
+fi
+mkdir -p "$(dirname "$PREFIX_FILE")" || exit 1
+tmp="$PREFIX_FILE.tmp.$$"
+printf '%s\n' "$prefix" > "$tmp" && chmod 0644 "$tmp" && mv "$tmp" "$PREFIX_FILE" || { rm -f "$tmp"; exit 1; }
+printf '%s\n' "$prefix"

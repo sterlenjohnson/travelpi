@@ -1,0 +1,21 @@
+# TravelPi wired WAN (installed to /etc/NetworkManager/system-connections/
+# by make deploy). When a hotel room jack is plugged into the USB-LAN/eth0,
+# this profile takes primary WAN with route metric 400; Wi-Fi STA profiles
+# run at metric 600, so NetworkManager fails over automatically in either
+# direction. DHCP-only; no static addresses (home management uses its own
+# profile).
+[connection]
+id=travelpi-wired-wan
+type=ethernet
+interface-name=eth0
+autoconnect=true
+autoconnect-priority=-10
+permissions=
+[ethernet]
+[ipv4]
+method=auto
+route-metric=400
+[ipv6]
+method=auto
+addr-gen-mode=stable-privacy
+route-metric=400

@@ -1,0 +1,3023 @@
+#!/usr/bin/python3
+"""Privileged, allowlisted helper for the TravelPi Cockpit package."""
+import ipaddress
+import json
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.parse
+from pathlib import Path
+
+HOSTAPD = Path('/etc/hostapd/hostapd.conf')
+WAN = 'wlan0'
+LAN = 'wlan1'
+SQM_SERVICE = 'travelpi-sqm.service'
+SQM_ENV_FILE = '/etc/default/travelpi-sqm'
+VPN_UNITS = {'tailscale': 'tailscaled', 'wireguard': 'wg-quick@wg0'}
+OPENVPN_UNIT = 'openvpn-client@travelpi.service'
+HELPER_TIMEOUT = 25
+MAC_RE = re.compile(r'^(?:[0-9a-f]{2}:){5}[0-9a-f]{2}$', re.I)
+RATE_RE = re.compile(r'^([0-9]+(?:\.[0-9]+)?)\s*(kbit|kbps|mbit|mbps|gbit|gbps)?$', re.I)
+WAN_PROBE_TIMEOUT = 6
+ADGUARD_CONFIG = Path('/opt/adguardhome/conf/AdGuardHome.yaml')
+DEVICE_SYS = Path('/sys/class/net')
+HWMON_SYS = Path('/sys/class/hwmon')
+USB_BUS_SYS = Path('/sys/bus/usb/devices')
+USB_OTG_ROOT = 'usb1'
+INA_SENSORS = {'ina219', 'ina226'}
+USB_DEVICE_RE = re.compile(r'^\d+-\d+(?:\.\d+)*$')
+POWER_LOG = Path('/var/lib/travelpi/power-log.jsonl')
+CLOCK_SYNC_CMD = ['/usr/bin/timedatectl', 'show', '--property=NTPSynchronized', '--value']
+FIRMWARE_CONFIG = Path('/boot/firmware/config.txt')
+FIRMWARE_DEMAND_KEYS = {'over_voltage', 'over_voltage_min', 'over_voltage_sdram',
+                        'over_voltage_sdram_c', 'over_voltage_sdram_i', 'arm_freq',
+                        'arm_freq_min', 'core_freq', 'core_freq_min', 'sdram_freq',
+                        'sdram_freq_min'}
+KERNEL_JOURNAL_CMD = ['/usr/bin/journalctl', '-k', '-b', '-q', '--no-pager']
+JOURNAL_EVENTS_CACHE = '/tmp/travelpi-%d-%s' % (os.geteuid(), 'journal-events.json')
+JOURNAL_EVENTS_TTL = 60
+RESOURCE_GUARD_DROPINS = {'unbound': '/etc/systemd/system/unbound.service.d/resource-guard.conf',
+                          'tailscaled': '/etc/systemd/system/tailscaled.service.d/resource-guard.conf',
+                          'hostapd': '/etc/systemd/system/hostapd.service.d/resource-guard.conf',
+                          'dnsmasq': '/etc/systemd/system/dnsmasq.service.d/resource-guard.conf',
+                          'containerd': '/etc/systemd/system/containerd.service.d/resource-guard.conf',
+                          'machine.slice': '/etc/systemd/system/machine.slice.d/travelpi-guard.conf',
+                          'user.slice': '/etc/systemd/system/user.slice.d/travelpi-guard.conf'}
+AP_ADDRESS = '192.168.200.1/24'
+DNSMASQ_CONF = Path('/etc/dnsmasq.d/travelpi.conf')
+# The AP's ULA /64 is per-install: one line in this file (see
+# systemd/travelpi-ula-init). No file means no ULA is configured.
+ULA_PREFIX_FILE = os.environ.get('TRAVELPI_ULA_PREFIX_FILE', '/etc/travelpi/ula-prefix')
+ULA_PREFIX_RE = re.compile(r'^fd[0-9a-f]{2}:[0-9a-f]{1,4}:[0-9a-f]{1,4}:[0-9a-f]{1,4}::/64$')
+
+
+def ula_prefix():
+    """The configured AP ULA /64, or None when absent or malformed."""
+    try:
+        line = Path(ULA_PREFIX_FILE).read_text().splitlines()[0].strip()
+    except (OSError, IndexError):
+        return None
+    return line if ULA_PREFIX_RE.match(line) else None
+
+
+def ap_v6_gateway():
+    """The ::1 gateway address (with /64) inside the configured prefix, or None."""
+    prefix = ula_prefix()
+    return prefix[:-len('::/64')] + '::1/64' if prefix else None
+
+
+ACTION_FIELDS = {
+    'connect_hotel': {'action', 'ssid', 'password', 'hidden', 'confirm'},
+    'apply_mac_clone': {'action', 'mac', 'mode', 'confirm'},
+    'set_ap_radio': {'action', 'band', 'channel', 'confirm'},
+    'set_wan_band': {'action', 'band', 'confirm'},
+    'set_ap_identity': {'action', 'ssid', 'passphrase', 'confirm'},
+    'set_cake_rate': {'action', 'rate_kbit', 'confirm'},
+    'restart_services': {'action', 'targets', 'confirm'},
+    'vpn_toggle': {'action', 'provider', 'enabled', 'confirm'},
+    'tailscale_auth': {'action', 'authkey', 'confirm'},
+    'wan_flip': {'action', 'wan', 'confirm'},
+    'reset_radios': {'action', 'confirm'},
+    'set_dns_stack': {'action', 'service', 'upstream', 'confirm'},
+    'set_ipv6': {'action', 'mode', 'confirm'},
+    'set_sqm_mode': {'action', 'mode', 'confirm'},
+    'set_cpu_governor': {'action', 'governor', 'confirm'},
+    'reclaim_memory': {'action', 'confirm'},
+    'wake_peer': {'action', 'target', 'confirm'},
+    'reboot': {'action', 'confirm'},
+}
+
+
+class HostAdapter:
+    """Private seam for fixed host commands; tests may replace this adapter."""
+
+    def run(self, argv, *, input_text=None, timeout=HELPER_TIMEOUT, check=False):
+        try:
+            return subprocess.run(argv, input=input_text, text=True, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, timeout=timeout, check=check,
+                                  env={'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LC_ALL': 'C'})
+        except subprocess.TimeoutExpired as expired:
+            # A hung host command must not abort the caller: restore-on-fail
+            # paths rely on a nonzero result (124 is timeout(1)'s convention).
+            return subprocess.CompletedProcess(argv, 124, '', 'timed out after %ss' % expired.timeout)
+
+
+HOST = HostAdapter()
+
+
+def run(argv, **kwargs):
+    return HOST.run(argv, **kwargs)
+
+
+def text(argv, **kwargs):
+    result = run(argv, **kwargs)
+    return result.stdout.strip()
+
+
+def ok(action, message, status=None):
+    payload = {'ok': True, 'action': action, 'message': message}
+    if status is not None:
+        payload['status'] = status
+    return payload
+
+
+def fail(code, message):
+    return {'ok': False, 'error': {'code': code, 'message': message}}
+
+
+def json_lines(value):
+    try:
+        return json.loads(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def first_line(value):
+    return (value or '').splitlines()[0].strip() if value else ''
+
+
+def band_for_frequency(frequency):
+    """Band name for a frequency in MHz, or None when unknown."""
+    try:
+        frequency = float(frequency)
+    except (TypeError, ValueError):
+        return None
+    if 2400 <= frequency < 2500:
+        return '2.4ghz'
+    if 4900 <= frequency < 5925:
+        return '5ghz'
+    if 5925 <= frequency <= 7125:
+        return '6ghz'
+    return None
+
+
+def parse_radio_capabilities(iw_info):
+    bands = set()
+    capabilities = set()
+    supported = {'2.4ghz': [], '5ghz': [], '6ghz': []}
+    # A band counts only when the radio reports at least one enabled
+    # frequency in it. Radar (DFS) frequencies still count: a WAN client may
+    # associate on them even though an unattended AP may not own them.
+    for match in re.finditer(r'\*\s+(\d+(?:\.\d+)?)\s+MHz([^\n]*)', iw_info or ''):
+        if 'disabled' in match.group(2):
+            continue
+        band = band_for_frequency(match.group(1))
+        if band:
+            bands.add(band)
+    # Per-band channel numbers as the hardware reports them (iw phy info
+    # prints "* 5520 MHz [104] (24.0 dBm) (no IR, radar detection)").
+    # Radar-detection channels are excluded: an unattended AP must not
+    # own a DFS channel.
+    for match in re.finditer(r'\*\s+(\d+(?:\.\d+)?)\s+MHz\s+\[(\d+)\]([^\n]*)', iw_info or ''):
+        frequency = float(match.group(1))
+        channel = int(match.group(2))
+        rest = match.group(3)
+        if 'radar detection' in rest or 'disabled' in rest or 'no IR' in rest:
+            # Radar (DFS) channels are excluded: an unattended AP must not
+            # own a DFS channel. Disabled channels are excluded: hostapd
+            # would fail on them. "no IR" (no initiating radiation) channels
+            # cannot host an AP, though a WAN client may still associate on
+            # them, so the bands set above still counts them.
+            continue
+        band = band_for_frequency(frequency)
+        if band:
+            supported[band].append(channel)
+    for band in supported:
+        supported[band] = sorted(set(supported[band]))
+    if re.search(r'\bHT(?:20|40)?/', iw_info or ''):
+        capabilities.add('wifi4')
+    if 'VHT' in (iw_info or ''):
+        capabilities.add('wifi5')
+    if 'HE' in (iw_info or ''):
+        capabilities.add('wifi6')
+    if '6ghz' in bands and 'wifi6' in capabilities:
+        capabilities.add('wifi6e')
+    if 'EHT' in (iw_info or ''):
+        capabilities.add('wifi7')
+    if re.search(r'^\s*\*\s+AP\s*$', iw_info or '', re.M):
+        capabilities.add('ap')
+    ordered_bands = [band for band in ('2.4ghz', '5ghz', '6ghz') if band in bands]
+    ordered_caps = [cap for cap in ('ap', 'wifi4', 'wifi5', 'wifi6', 'wifi6e', 'wifi7') if cap in capabilities]
+    return {'bands': ordered_bands, 'capabilities': ordered_caps, 'supported_channels': supported}
+
+
+def interface_hardware(interface):
+    role = 'wan' if interface == WAN else ('ap' if interface == LAN else 'unknown')
+    record = {'interface': interface, 'role': role, 'present': False,
+              'label': 'Pi internal Wi-Fi' if role == 'wan' else ('USB Wi-Fi adapter' if role == 'ap' else 'Wi-Fi radio'),
+              'model': None, 'transport': None, 'driver': None,
+              'bands': [], 'capabilities': []}
+    device = DEVICE_SYS / interface
+    if not device.exists():
+        return record
+    record['present'] = True
+    try:
+        path = str(device.joinpath('device').resolve())
+    except OSError:
+        path = ''
+    driver_path = device / 'device' / 'driver'
+    try:
+        record['driver'] = driver_path.resolve().name
+    except OSError:
+        record['driver'] = 'unknown'
+    try:
+        phy_name = (device / 'phy80211' / 'name').read_text().strip()
+        iw_info = text(['/sbin/iw', 'phy', phy_name, 'info']) if phy_name else ''
+        radio_caps = parse_radio_capabilities(iw_info)
+        record.update(radio_caps)
+    except Exception:
+        pass
+    if 'mmc1' in path or interface == WAN:
+        record.update(label='Pi internal Wi-Fi', model='Broadcom BCM43430', transport='SDIO')
+        return record
+    if 'usb' in path:
+        vendor = model = ''
+        try:
+            properties = text(['/usr/bin/udevadm', 'info', '--query=property', '--path', str(device)])
+            for line in properties.splitlines():
+                if line.startswith('ID_VENDOR='):
+                    vendor = line.split('=', 1)[1].replace('_', ' ')
+                elif line.startswith('ID_MODEL='):
+                    model = line.split('=', 1)[1].replace('_', ' ')
+        except Exception:
+            pass
+        record.update(label='USB Wi-Fi adapter', model=(vendor + ' ' + model).strip() or 'USB wireless adapter', transport='USB')
+        return record
+    record.update(label='Wi-Fi radio', model='Unknown hardware', transport='Unknown')
+    return record
+
+
+def ipv4_address(interface):
+    try:
+        output = text(['/sbin/ip', '-4', '-o', 'addr', 'show', 'dev', interface])
+    except Exception:
+        return None
+    match = re.search(r'inet\s+(\S+)', output)
+    return match.group(1) if match else None
+
+
+def ensure_ipv6_link_local(interface):
+    """Router advertisements must be sourced from a link-local address
+    (RFC 4861). The kernel regenerates link-local only on an IPv6 enable
+    edge, so a flushed interface keeps no link-local until it is toggled;
+    the toggle also removes global v6 addresses, which is why the AP's
+    ULA gateway is (re)applied after it. Returns True when a toggle ran.
+    """
+    try:
+        out = text(['/sbin/ip', '-6', 'addr', 'show', 'dev', interface, 'scope', 'link'])
+        if 'fe80::' in out:
+            return False
+    except Exception:
+        pass
+    run(['/usr/sbin/sysctl', '-qw', 'net.ipv6.conf.%s.disable_ipv6=1' % interface], timeout=10)
+    run(['/usr/sbin/sysctl', '-qw', 'net.ipv6.conf.%s.disable_ipv6=0' % interface], timeout=10)
+    try:
+        out = text(['/sbin/ip', '-6', 'addr', 'show', 'dev', interface, 'scope', 'link'])
+        return 'fe80::' in out
+    except Exception:
+        return False
+
+
+def split_terse(line):
+    """Split one `nmcli -t` line on unescaped ':' and unescape '\\:' and '\\\\'."""
+    fields, cur, i = [], [], 0
+    while i < len(line):
+        ch = line[i]
+        if ch == '\\' and i + 1 < len(line):
+            cur.append(line[i + 1])
+            i += 2
+            continue
+        if ch == ':':
+            fields.append(''.join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+        i += 1
+    fields.append(''.join(cur))
+    return fields
+
+
+def active_profile(interface):
+    try:
+        output = text(['/usr/bin/nmcli', '-t', '-f', 'NAME,DEVICE', 'connection', 'show', '--active'])
+    except Exception:
+        return None
+    for line in output.splitlines():
+        parts = split_terse(line)
+        if len(parts) == 2 and parts[1] == interface:
+            return parts[0]
+    return None
+
+
+def service_state(unit):
+    try:
+        return first_line(text(['/bin/systemctl', 'is-active', unit])) or 'unknown'
+    except Exception:
+        return 'unknown'
+
+
+def unit_available(unit):
+    try:
+        return text(['/bin/systemctl', 'show', '-p', 'LoadState', '--value', unit]) != 'not-found'
+    except Exception:
+        return False
+
+
+def parse_link(interface):
+    try:
+        output = text(['/sbin/iw', 'dev', interface, 'link'])
+    except Exception:
+        return {}
+    data = {}
+    for line in output.splitlines():
+        line = line.strip()
+        if line.startswith('SSID:'):
+            data['ssid'] = line.split(':', 1)[1].strip()
+        elif line.startswith('freq:'):
+            data['freq'] = int(float(line.split(':', 1)[1].strip()))
+        elif line.startswith('signal:'):
+            data['signal_dbm'] = int(line.split(':', 1)[1].strip().split()[0])
+        elif line.startswith('tx bitrate:'):
+            data['tx_bitrate'] = line.split(':', 1)[1].strip()
+        elif line.startswith('rx bitrate:'):
+            data['rx_bitrate'] = line.split(':', 1)[1].strip()
+    return data
+
+
+def parse_ap(interface):
+    data = {}
+    try:
+        output = text(['/sbin/iw', 'dev', interface, 'info'])
+    except Exception:
+        return data
+    for line in output.splitlines():
+        line = line.strip()
+        if line.startswith('ssid '):
+            data['ssid'] = line[5:].strip()
+        elif line.startswith('channel '):
+            match = re.search(r'channel\s+(\d+)\s+\((\d+)\s+MHz\)(?:, width:\s*([^,]+))?', line)
+            if match:
+                data['channel'] = int(match.group(1))
+                data['freq'] = int(match.group(2))
+                if match.group(3):
+                    data['width'] = match.group(3).strip()
+        elif line.startswith('txpower '):
+            data['txpower_dbm'] = line.split()[1]
+        elif line.startswith('type '):
+            data['type'] = line[5:].strip()
+    return data
+
+
+def clients():
+    items = []
+    by_mac = {}
+    try:
+        leases = Path('/var/lib/misc/dnsmasq.leases').read_text(errors='replace')
+    except Exception:
+        leases = ''
+    for line in leases.splitlines():
+        parts = line.split()
+        if len(parts) >= 4:
+            item = {'mac': parts[1], 'ip': parts[2], 'hostname': parts[3]}
+            by_mac[parts[1].lower()] = item
+            items.append(item)
+    try:
+        station = text(['/sbin/iw', 'dev', LAN, 'station', 'dump'])
+    except Exception:
+        station = ''
+    current = None
+    for line in station.splitlines():
+        stripped = line.strip()
+        if stripped.startswith('Station '):
+            mac = stripped.split()[1].lower()
+            current = by_mac.get(mac)
+            if current is None:
+                current = {'mac': mac, 'ip': None, 'hostname': None}
+                items.append(current)
+            current['signal_dbm'] = stripped.split('signal: ', 1)[1].split()[0] if 'signal: ' in stripped else current.get('signal_dbm')
+        elif current is not None and stripped.startswith('signal:'):
+            current['signal_dbm'] = stripped.split(':', 1)[1].strip().split()[0]
+        elif current is not None and stripped.startswith('tx bitrate:'):
+            current['tx_bitrate'] = stripped.split(':', 1)[1].strip()
+        elif current is not None and stripped.startswith('rx bitrate:'):
+            current['rx_bitrate'] = stripped.split(':', 1)[1].strip()
+    return {'count': len(items), 'items': items[:64]}
+
+
+def route_status():
+    try:
+        output = text(['/sbin/ip', 'route', 'show', 'default'])
+    except Exception:
+        return {}
+    match = re.search(r'default via (\S+) dev (\S+)', output)
+    return {'gateway': match.group(1), 'interface': match.group(2)} if match else {}
+
+
+PORTAL_PROBE_CMD = ['/usr/bin/curl', '--ipv4', '--connect-timeout', '4', '--max-time', '8',
+                    '--silent', '--write-out', '%{http_code} %{redirect_url}',
+                    '--output', '/dev/null', 'http://neverssl.com/']
+PORTAL_CACHE = '/tmp/travelpi-%d-%s' % (os.geteuid(), 'portal-cache.json')
+PORTAL_CACHE_TTL = 600
+
+
+PORTAL_PRIVATE_V4 = tuple(ipaddress.ip_network(net) for net in (
+    '10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16', '169.254.0.0/16', '127.0.0.0/8', '100.64.0.0/10'))
+PORTAL_PRIVATE_V6 = tuple(ipaddress.ip_network(net) for net in ('fc00::/7', 'fe80::/10', '::1/128'))
+
+
+def redirect_host(url):
+    """Lower-cased host of an http(s) URL (userinfo, port and IPv6 brackets
+    removed), or '' when the URL is empty or malformed."""
+    try:
+        parts = urllib.parse.urlsplit((url or '').strip())
+        host = parts.hostname or ''
+        parts.port  # raises ValueError on a malformed port
+    except ValueError:
+        return ''
+    return host.lower() if parts.scheme in ('http', 'https') else ''
+
+
+def redirects_to_private_address(redirect_url, probe_host=None):
+    """True when a redirect target looks like a hotel captive portal
+    intercepting plain HTTP: a private/link-local/loopback/CGNAT address
+    (IPv4 or IPv6 literal), or, when probe_host is a hostname, a hostname
+    outside the probe host's registrable domain (last two labels; so
+    google.com -> www.google.com is not a portal, -> portal.hotel.example is).
+    A heuristic: multi-part public suffixes (co.uk) compare as one domain."""
+    host = redirect_host(redirect_url)
+    if not host:
+        return False
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        address = None
+    if address is not None:
+        networks = PORTAL_PRIVATE_V4 if address.version == 4 else PORTAL_PRIVATE_V6
+        return any(address in net for net in networks)
+    probe = (probe_host or '').lower().rstrip('.')
+    if not probe:
+        return False
+    try:
+        ipaddress.ip_address(probe)
+        return False  # probing an address: a vhost redirect says nothing
+    except ValueError:
+        pass
+    return host.rstrip('.').split('.')[-2:] != probe.split('.')[-2:]
+
+
+def portal_status(force=False):
+    """Captive-portal hint (display only; never automates login): probe the
+    always-plain site neverssl.com. A redirect to a private address means the
+    hotel portal is intercepting traffic. Cached for PORTAL_CACHE_TTL seconds
+    so dashboard polling costs nothing; force=True bypasses the cache (the
+    dashboard's re-check button). Monotonic clock (this board has no
+    RTC; wall time jumps at boot and at sync)."""
+    # No default route on a WAN uplink (wlan0 or the wired eth0) means there is
+    # nothing to probe through; a cached or fresh 'portal' would be a false
+    # claim, so report unknown without probing or touching the cache.
+    if route_status().get('interface') not in (WAN, 'eth0'):
+        return {'state': 'unknown', 'portal_url': None, 'age_s': 0}
+    now = time.monotonic()
+    if not force:
+        cached = read_private_cache(PORTAL_CACHE, ('ts', 'state'))
+        stamp = cached.get('ts') if cached else None
+        if isinstance(stamp, (int, float)) and not isinstance(stamp, bool) and 0 <= now - stamp < PORTAL_CACHE_TTL:
+            return {'state': cached.get('state', 'unknown'),
+                    'portal_url': cached.get('portal_url'),
+                    'age_s': round(now - stamp)}
+    state, portal = 'online', None
+    try:
+        result = run(PORTAL_PROBE_CMD, timeout=12)
+        out = (result.stdout or '').split()
+        code = int(out[0]) if out and out[0].isdigit() else 0
+        redirect = out[1] if len(out) > 1 else ''
+        if code == 511 or redirects_to_private_address(redirect, 'neverssl.com'):
+            state, portal = 'portal', redirect or None
+        elif result.returncode == 0 and 200 <= code < 400:
+            state = 'online'
+        elif result.returncode in (6, 7, 28):
+            state = 'blocked'
+        else:
+            state = 'unknown'
+    except (OSError, subprocess.TimeoutExpired):
+        state = 'unknown'
+    try:
+        write_private_file(PORTAL_CACHE, json.dumps({'ts': now, 'state': state, 'portal_url': portal}), 0o600)
+    except OSError:
+        pass
+    return {'state': state, 'portal_url': portal, 'age_s': 0}
+
+
+def network_health():
+    try:
+        resolv = Path('/etc/resolv.conf').read_text(errors='replace')
+        dns = [line.split()[1] for line in resolv.splitlines() if line.startswith('nameserver ')][:4]
+    except Exception:
+        dns = []
+    try:
+        forwarding = Path('/proc/sys/net/ipv4/ip_forward').read_text().strip() == '1'
+    except Exception:
+        forwarding = None
+    return {'dns': dns, 'forwarding': forwarding}
+
+
+def route_status_for(interface):
+    try:
+        output = text(['/sbin/ip', '-4', 'route', 'show', 'default', 'dev', interface])
+    except Exception:
+        return {}
+    for line in output.splitlines():
+        if not re.match(r'^default(?:\s|$)', line):
+            continue
+        gateway = re.search(r'\bvia\s+(\S+)', line)
+        return {'interface': interface, 'gateway': gateway.group(1) if gateway else None}
+    return {}
+
+
+PROBE_TARGET_RE = re.compile(r'^[A-Za-z0-9.\-]{1,253}$')
+
+
+def validate_probe_target(target):
+    if not isinstance(target, str):
+        return None
+    target = target.strip().lower()
+    if not target or target.startswith('http://') or target.startswith('https://') \
+            or '/' in target or ':' in target or ' ' in target:
+        return None
+    if not PROBE_TARGET_RE.match(target):
+        return None
+    return target
+
+
+def fixed_http_probe(target):
+    """Run the interface-bound HTTP check against the given host."""
+    started = time.monotonic()
+    url = 'http://' + target + '/'
+    try:
+        result = run([
+            '/usr/bin/curl',
+            '--interface', WAN,
+            '--ipv4',
+            '--connect-timeout', '4',
+            '--max-time', str(WAN_PROBE_TIMEOUT),
+            '--silent',
+            '--show-error',
+            '--output', '/dev/null',
+            '--write-out', '%{http_code} %{redirect_url}',
+            '--url', url,
+        ], timeout=WAN_PROBE_TIMEOUT + 2)
+    except (OSError, subprocess.TimeoutExpired):
+        return {'http_status': None, 'redirect_url': '', 'returncode': None,
+                'duration_ms': round((time.monotonic() - started) * 1000)}
+
+    match = re.fullmatch(r'\s*(\d{3})(?:\s+(\S*))?\s*', result.stdout or '')
+    return {
+        'http_status': int(match.group(1)) if match else None,
+        'redirect_url': (match.group(2) or '') if match else '',
+        'returncode': result.returncode,
+        'duration_ms': round((time.monotonic() - started) * 1000),
+    }
+
+
+def probe_result(state, *, associated, address=None, route=None, http_status=None, duration_ms=None, target='google.com'):
+    probe = {
+        'interface': WAN,
+        'status': state,
+        'target': target,
+        'url': 'http://' + target + '/',
+        'associated': associated,
+        'ip': address,
+        'gateway': (route or {}).get('gateway'),
+        'http_status': http_status,
+    }
+    if duration_ms is not None:
+        probe['duration_ms'] = duration_ms
+    if associated:
+        probe['association'] = 'ASSOCIATED'
+    return {
+        'ok': True,
+        'action': 'probe',
+        'message': 'WAN probe completed: ' + state,
+        'status': state,
+        'probe': probe,
+    }
+
+
+def probe(target='google.com'):
+    """Return a bounded WAN health result against the given host (default google.com)."""
+    link = parse_link(WAN)
+    if not link:
+        return probe_result('ASSOCIATION_FAILED', associated=False, target=target)
+
+    address = ipv4_address(WAN)
+    if not address or address.startswith('169.254.'):
+        return probe_result('NO_DHCP', associated=True, address=address, target=target)
+
+    route = route_status_for(WAN)
+    if not route:
+        return probe_result('NO_ROUTE', associated=True, address=address, target=target)
+
+    http = fixed_http_probe(target)
+    http_status = http.get('http_status')
+    returncode = http.get('returncode')
+    if returncode == 6:
+        state = 'NO_DNS'
+    elif returncode == 0 and http_status is not None and (200 <= http_status < 400 or http_status == 511):
+        # A portal answers plain HTTP with 511 or a 3xx/200 redirect to a
+        # private address (the same test portal_status() applies).
+        captive = http_status == 511 or redirects_to_private_address(http.get('redirect_url'), target)
+        state = 'CAPTIVE_PORTAL' if captive else 'INTERNET_OK'
+    else:
+        state = 'NO_INTERNET'
+    return probe_result(state, associated=True, address=address, route=route,
+                        http_status=http_status, duration_ms=http.get('duration_ms'), target=target)
+
+
+def parse_wifi_scan(output):
+    networks = []
+    current = None
+    for line in (output or '').splitlines():
+        if line.startswith('BSS '):
+            if current and current.get('ssid'):
+                networks.append(current)
+            current = {'ssid': None, 'signal_dbm': None, 'frequency_mhz': None, 'channel': None, 'band': None, 'security': 'open', 'auth': [], '_privacy': False}
+        elif current is not None:
+            stripped = line.strip()
+            if stripped.lower().startswith('signal:'):
+                # iw dev scan prints "Signal: -53 dBm" (capital S); iw
+                # survey dumps print "Signal level:". Accept both.
+                match = re.search(r'(-?\d+(?:\.\d+)?)', stripped)
+                current['signal_dbm'] = float(match.group(1)) if match else None
+            elif stripped.startswith('freq:'):
+                match = re.search(r'(\d+)', stripped)
+                if match:
+                    frequency = int(match.group(1))
+                    current['frequency_mhz'] = frequency
+                    current['band'] = '2.4ghz' if frequency < 2500 else ('5ghz' if frequency < 5925 else '6ghz')
+            elif stripped.startswith('SSID:'):
+                current['ssid'] = stripped.split(':', 1)[1].strip()
+            elif stripped.startswith(('RSN:', 'WPA:')):
+                # Real iw output is "RSN:\t * Version: 1" (tab-indented, with
+                # content on the same line), never a bare "RSN:".
+                current['security'] = 'secured'
+            elif stripped.startswith('capability:') and 'Privacy' in stripped:
+                # Privacy with no RSN/WPA element means WEP; still secured.
+                current['_privacy'] = True
+            elif stripped.startswith('* Authentication suites:'):
+                for suite in stripped.split(':', 1)[1].split():
+                    if suite not in current['auth']:
+                        current['auth'].append(suite)
+    if current and current.get('ssid'):
+        networks.append(current)
+    for network in networks:
+        if network.pop('_privacy', False):
+            network['security'] = 'secured'
+        frequency = network.get('frequency_mhz') or 0
+        if frequency == 2484:
+            network['channel'] = 14
+        elif frequency >= 5925:
+            # 6 GHz (Wi-Fi 6E): channel = (freq - 5950) / 5; 5955 MHz is channel 1.
+            network['channel'] = max(1, (frequency - 5950) // 5)
+        elif frequency >= 5000:
+            network['channel'] = max(1, round((frequency - 5000) / 5))
+        elif frequency >= 2400:
+            network['channel'] = max(1, round((frequency - 2407) / 5))
+    return sorted(networks, key=lambda item: item.get('signal_dbm') if item.get('signal_dbm') is not None else -999, reverse=True)
+
+
+def wifi_scan():
+    if pressure_status().get('pressured'):
+        return fail('load_shed', 'Wi-Fi scan deferred while the Pi is under load')
+    # A hung or busy radio must read as a failed scan, never as an empty
+    # neighbourhood: check the return code and retry once before reporting.
+    last_code = None
+    for attempt in (1, 2):
+        try:
+            result = run(['/sbin/iw', 'dev', WAN, 'scan'], timeout=20)
+        except Exception:
+            return fail('scan_failed', 'The fixed WAN Wi-Fi scan failed')
+        last_code = result.returncode
+        if result.returncode == 0 and result.stdout.strip():
+            return {'ok': True, 'action': 'wifi_scan', 'networks': parse_wifi_scan(result.stdout)}
+        if attempt == 1:
+            time.sleep(2)
+    if last_code == 124:
+        return fail('scan_timeout', 'The Wi-Fi radio did not answer the scan in time; try again in a few seconds.')
+    if last_code:
+        return fail('scan_busy', 'The Wi-Fi radio is busy or recovering; try the scan again in a few seconds.')
+    return {'ok': True, 'action': 'wifi_scan', 'networks': []}
+
+
+def wired_uplink_status():
+    try:
+        link = text(['/sbin/ip', '-o', 'link', 'show', 'dev', 'eth0'])
+        address = ipv4_address('eth0')
+        route = route_status_for('eth0')
+        return {'interface': 'eth0', 'present': bool(link), 'link': 'UP' in link,
+                'address': address, 'gateway': route.get('gateway'),
+                'verified': False, 'role': 'management-only',
+                'readiness': 'wired WAN testing unavailable until a LAN uplink is connected'}
+    except Exception:
+        return {'interface': 'eth0', 'present': False, 'link': False, 'address': None,
+                'gateway': None, 'verified': False, 'role': 'management-only',
+                'readiness': 'unavailable'}
+
+
+def memory_guards_status():
+    guarded = sorted(name for name, path in RESOURCE_GUARD_DROPINS.items()
+                     if Path(path).exists())
+    return {'guarded_units': guarded,
+            'unprotected_units': sorted(set(RESOURCE_GUARD_DROPINS) - set(guarded))}
+
+
+def firmware_readiness_status():
+    overrides = firmware_config_overrides()
+    if overrides is None:
+        return {'state': 'unknown', 'overrides': None}
+    return {'state': 'elevated' if overrides else 'ok', 'overrides': overrides}
+
+
+def readiness_status():
+    return {'wired': wired_uplink_status(),
+            'wifi_scan': {'interface': WAN, 'available': True, 'automatic': False},
+            'transient_networkmanager': {'available': False, 'reason': 'Not activated until volatile-profile support is verified'},
+            'role_switch': {'available': False, 'reason': 'Requires wired-uplink evidence and rollback testing'},
+            'ap_profiles': {'tested': ['2.4ghz', '5ghz'], 'all_bands': False},
+            'firmware': firmware_readiness_status(),
+            'memory_guards': memory_guards_status()}
+
+
+SQM_AUTOTUNE_STATE = '/var/lib/travelpi/sqm-autotune.json'
+POWER_PROFILE_ENV = '/etc/default/travelpi-power-profile'
+STATUS_CACHE = '/tmp/travelpi-%d-%s' % (os.geteuid(), 'status-cache.json')
+STATUS_CACHE_TTL = 5
+SQM_AUTOTUNE_FRESH = 6 * 3600
+
+
+def sqm_autotune_status():
+    """Visibility for the SQM auto-tuner: mode (auto vs dashboard-pinned),
+    last measurement, and the rates it applied."""
+    pinned = False
+    try:
+        pinned = 'TRAVELPI_SQM_AUTOTUNE=no' in Path(SQM_ENV_FILE).read_text(errors='replace')
+    except OSError:
+        pass
+    result = {'mode': 'pinned' if pinned else 'auto', 'state': 'off'}
+    try:
+        data = json.loads(Path(SQM_AUTOTUNE_STATE).read_text(errors='replace'))
+    except Exception:
+        return result
+    age = int(time.time() - (data.get('ts') or 0))
+    result['age_s'] = age
+    for key in ('down_mbit', 'up_mbit', 'applied_down_mbit', 'applied_up_mbit'):
+        result[key] = data.get(key)
+    if data.get('last_error'):
+        result['state'] = 'probe-failed'
+    elif not data.get('applied_down_mbit'):
+        result['state'] = 'off'
+    elif pinned:
+        result['state'] = 'pinned'
+    elif age < SQM_AUTOTUNE_FRESH:
+        result['state'] = 'active'
+    else:
+        result['state'] = 'stale'
+    return result
+
+
+def cake_status():
+    autotune = sqm_autotune_status()
+    try:
+        output = text(['/sbin/tc', 'qdisc', 'show', 'dev', WAN])
+    except Exception:
+        return {'state': 'unknown', 'mode': autotune.get('mode'), 'autotune': autotune}
+    match = re.search(r'qdisc\s+(\S+).*?bandwidth\s+(\S+)', output)
+    if not match:
+        return {'interface': WAN, 'state': 'inactive', 'mode': 'off', 'qdisc': first_line(output) or 'none',
+                'autotune': autotune}
+    return {'interface': WAN, 'state': 'active', 'mode': autotune.get('mode'), 'qdisc': match.group(1),
+            'rate': match.group(2), 'autotune': autotune}
+
+
+def process_active(name):
+    try:
+        return run(['/usr/bin/pgrep', '-x', name]).returncode == 0
+    except Exception:
+        return False
+
+
+ADGUARD_DNS_PROBE_CMD = ['/usr/bin/dig', '+short', '+time=2', '+tries=1', '@127.0.0.1', 'example.com', 'A']
+
+
+def dns_responder_live():
+    """AdGuard is the host's :53 responder; a real lookup through it is the
+    evidence. (Cockpit runs the helper as the unprivileged login user, where
+    `ss -lntup` cannot see other users' socket owners.)"""
+    try:
+        return bool(text(ADGUARD_DNS_PROBE_CMD, timeout=8).strip())
+    except Exception:
+        return False
+
+
+def adguard_upstreams(config):
+    """The upstream_dns entries from AdGuardHome.yaml (its own list block)."""
+    match = re.search(r'^  upstream_dns:\s*\n((?:    - .*\n?)+)', config or '', re.M)
+    if not match:
+        return []
+    return [line.strip()[2:].strip().strip("'\"") for line in match.group(1).splitlines() if line.strip()]
+
+
+def adguard_dns_status():
+    try:
+        config = ADGUARD_CONFIG.read_text(errors='replace')
+    except OSError:
+        config = ''
+    if not config:
+        # AdGuard rewrites its yaml at 0600; Cockpit runs this helper as the
+        # login user. The deploy installs a sudoers rule that allows exactly
+        # this one cat, and nothing else.
+        try:
+            config = text(['sudo', '/bin/cat', ADGUARD_CONFIG], timeout=10)
+        except Exception:
+            config = ''
+    upstreams = adguard_upstreams(config)
+    # fallback_dns also names Unbound (127.0.0.1:5335); only an upstream_dns
+    # entry decides which resolver actually answers.
+    recursive = '127.0.0.1:5335' in upstreams
+    wan_dns = any(not u.startswith('[/') and not u.startswith('https://')
+                  and not u.startswith('127.') for u in upstreams)
+    doh = any(u.startswith('https://cloudflare-dns.com/dns-query') for u in upstreams)
+    split = any('100.100.100.100' in u for u in upstreams)
+    nat64 = 'nat64_prefix' in config
+    if split and nat64:
+        upstream = 'Hotel WAN DNS + tailnet split + DNS64'
+    elif split:
+        upstream = 'Hotel WAN DNS + tailnet split'
+    elif doh:
+        upstream = 'Cloudflare DoH'
+    elif wan_dns:
+        upstream = 'Hotel WAN DNS (Unbound fallback)'
+    elif recursive:
+        upstream = 'Unbound recursive'
+    else:
+        upstream = None
+    mode = ('tailnet-split' if split else ('cloudflare-doh' if doh else
+            ('wan-dns' if wan_dns else ('recursive' if recursive else 'unknown'))))
+    running = process_active('AdGuardHome')
+    resolving = dns_responder_live()
+    active = running and resolving
+    configured = bool(config)
+    # 'degraded' = AdGuard is up but a real lookup fails (typically no WAN or
+    # an unreachable upstream); distinct from the service being down.
+    service = 'active' if active else ('degraded' if running else 'inactive')
+    return {
+        'service': service,
+        'resolving': resolving,
+        'mode': mode,
+        'stack_mode': dns_stack_mode(),
+        'configured': configured,
+        'upstream': upstream,
+        'verified': active and configured,
+        'admin_url': 'http://192.168.200.1/',
+    }
+
+
+# Canonical vcgencmd get_throttled bit map (Raspberry Pi firmware docs):
+#   0x1 undervoltage now, 0x2 ARM capped now, 0x4 ARM limited now, 0x8 temp limit now.
+#   History bits exist in two encodings: legacy low-nibble 0x10/0x20/0x40/0x80 and
+#   modern high-word 0x10000/0x20000/0x40000/0x80000. Decode both; a Zero 2 W
+#   brown-out on current firmware reports 0x10000+.
+THROTTLE_UNDER_VOLT_NOW = 0x1
+THROTTLE_ARM_CAPPED_NOW = 0x2
+THROTTLE_ARM_LIMITED_NOW = 0x4
+THROTTLE_TEMPERATURE_NOW = 0x8
+THROTTLE_UNDER_VOLT_HISTORY = 0x10 | 0x10000
+THROTTLE_ARM_CAPPED_HISTORY = 0x20 | 0x20000
+THROTTLE_ARM_LIMITED_HISTORY = 0x40 | 0x40000
+THROTTLE_TEMPERATURE_HISTORY = 0x80 | 0x80000
+THROTTLE_FLAG_FIELDS = ('under_volt_now', 'under_volt_history', 'throttle_now',
+                        'throttle_history', 'temp_throttle_now', 'temp_throttle_history')
+POWER_SIGNALS = ('undervolt-now', 'undervolt-history', 'throttle-now', 'throttle-history',
+                 'temperature-now', 'temperature-history', 'clean', 'unavailable')
+THROTTLE_SIGNAL_FLAGS = {
+    'undervolt-now': 'under_volt_now',
+    'undervolt-history': 'under_volt_history',
+    'throttle-now': 'throttle_now',
+    'throttle-history': 'throttle_history',
+    'temperature-now': 'temp_throttle_now',
+    'temperature-history': 'temp_throttle_history',
+}
+THROTTLE_DETAILS = {
+    'clean': 'No current or historical power-throttle flags.',
+    'undervolt-now': 'Under-voltage is happening now — reduce load / check both power sources.',
+    'undervolt-history': 'Under-voltage occurred since this boot (check the Pi Zero 2 W dual power sources).',
+    'throttle-now': 'CPU throttling is active.',
+    'throttle-history': 'CPU throttling is active.',
+    'temperature-now': 'Temperature throttling flags are present.',
+    'temperature-history': 'Temperature throttling flags are present.',
+}
+
+
+def decode_throttle_bits(value):
+    """Decode the vcgencmd get_throttled bitmask into flags and a priority signal."""
+    flags = {
+        'under_volt_now': bool(value & THROTTLE_UNDER_VOLT_NOW),
+        'under_volt_history': bool(value & THROTTLE_UNDER_VOLT_HISTORY),
+        'throttle_now': bool(value & (THROTTLE_ARM_CAPPED_NOW | THROTTLE_ARM_LIMITED_NOW)),
+        'throttle_history': bool(value & (THROTTLE_ARM_CAPPED_HISTORY | THROTTLE_ARM_LIMITED_HISTORY)),
+        'temp_throttle_now': bool(value & THROTTLE_TEMPERATURE_NOW),
+        'temp_throttle_history': bool(value & THROTTLE_TEMPERATURE_HISTORY),
+    }
+    signal = 'clean'
+    for candidate, key in THROTTLE_SIGNAL_FLAGS.items():
+        if flags[key]:
+            signal = candidate
+            break
+    flags['signal'] = signal
+    return flags
+
+
+def parse_core_volts(output):
+    match = re.search(r'volt=([0-9]+(?:\.[0-9]+)?)\s*V', output or '', re.I)
+    if not match:
+        return None
+    try:
+        return float(match.group(1))
+    except ValueError:
+        return None
+
+
+def current_sensor_reading():
+    """Read an optional INA219/INA226 hwmon sensor: name, milliamps, watts (null when absent)."""
+    record = {'current_sensor': None, 'current_ma': None, 'power_w': None}
+    try:
+        directories = sorted(HWMON_SYS.glob('hwmon*'))
+    except OSError:
+        return record
+    for directory in directories:
+        try:
+            name = (directory / 'name').read_text(errors='replace').strip().lower()
+        except OSError:
+            continue
+        matched = next((sensor for sensor in INA_SENSORS if sensor in name), None)
+        if matched is None:
+            continue
+        record['current_sensor'] = matched
+        for field, filename, scale, digits in (('current_ma', 'in2_input', 1000.0, 1),
+                                               ('power_w', 'power1_input', 1000.0, 2)):
+            try:
+                raw = int((directory / filename).read_text(errors='replace').strip())
+            except (OSError, ValueError):
+                continue
+            record[field] = round(raw / scale, digits)
+        break
+    return record
+
+
+def usb_otg_status():
+    record = {'usb_otg_present': (USB_BUS_SYS / USB_OTG_ROOT).is_dir(), 'usb_devices': None,
+              'usb_demand_ma': None}
+    try:
+        devices = [entry for entry in USB_BUS_SYS.iterdir() if USB_DEVICE_RE.match(entry.name)]
+        record['usb_devices'] = len(devices)
+        demand = 0
+        for entry in devices:
+            try:
+                # Hosts report bMaxPower as bare milliamps or with an 'mA' suffix.
+                digits = re.sub(r'\D', '', (entry / 'bMaxPower').read_text(errors='replace'))
+            except OSError:
+                continue
+            if digits:
+                demand += int(digits)
+        record['usb_demand_ma'] = demand
+    except OSError:
+        pass
+    return record
+
+
+def power_recorder_status():
+    """Read the boot power recorder log: an unexpected shutdown (crash/power-loss)
+    is flagged when the latest unexpected-shutdown event post-dates the latest
+    clean-shutdown marker. Null when the recorder log is absent."""
+    record = {'unexpected_shutdown': None, 'power_loss_count': None}
+    try:
+        events = []
+        for line in POWER_LOG.read_text(errors='replace').splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                events.append(json.loads(line).get('event'))
+            except (ValueError, TypeError):
+                continue
+    except OSError:
+        return record
+    if events:
+        last_unexpected = max((i for i, e in enumerate(events)
+                               if e == 'unexpected-shutdown'), default=-1)
+        last_clean = max((i for i, e in enumerate(events)
+                          if e == 'clean-shutdown'), default=-1)
+        record['unexpected_shutdown'] = last_unexpected > last_clean
+        record['power_loss_count'] = sum(1 for e in events if e == 'unexpected-shutdown')
+    return record
+
+
+def clock_synced():
+    """NTP sync state from timedatectl; None when unresolvable (degrade explicitly)."""
+    try:
+        value = text(CLOCK_SYNC_CMD).strip().lower()
+    except Exception:
+        return None
+    if value == 'yes':
+        return True
+    if value == 'no':
+        return False
+    return None
+
+
+def firmware_config_overrides():
+    """Rail-demand-relevant firmware settings from config.txt (allowlisted keys only);
+    None when the file is unreadable."""
+    try:
+        lines = FIRMWARE_CONFIG.read_text(errors='replace').splitlines()
+    except OSError:
+        return None
+    overrides = []
+    for line in lines:
+        match = re.match(r'^\s*([A-Za-z0-9_]+)\s*=\s*(\S+)', line.split('#', 1)[0])
+        if match and match.group(1) in FIRMWARE_DEMAND_KEYS:
+            overrides.append(match.group(1) + '=' + match.group(2))
+    return overrides
+
+
+def journal_power_events():
+    """Cached kernel-journal scan: throttle events, radio resets, filesystem errors."""
+    cached = fresh_cache(JOURNAL_EVENTS_CACHE, ('events',), JOURNAL_EVENTS_TTL)
+    if cached and isinstance(cached['events'], dict):
+        return cached['events']
+    throttle_events = 0
+    radio_reset_events = 0
+    radio_link_events = 0
+    fs_errors = 0
+    try:
+        for line in text(KERNEL_JOURNAL_CMD, timeout=15).splitlines():
+            if 'Throttling detected' in line:
+                throttle_events += 1
+            low = line.lower()
+            if 'mt7921' in low or 'mt7925' in low:
+                if 'reset' in low:
+                    radio_reset_events += 1
+                elif 'vendor request' in low and 'failed' in low:
+                    radio_link_events += 1
+            if 'EXT4-fs error' in line:
+                fs_errors += 1
+    except Exception:
+        pass
+    events = {'throttle_events': throttle_events,
+              'radio_reset_events': radio_reset_events,
+              'radio_link_events': radio_link_events,
+              'fs_errors': fs_errors}
+    store_cache(JOURNAL_EVENTS_CACHE, events=events)
+    return events
+
+
+RADIO_RECOVERY_LOG = '/var/lib/travelpi/radio-recoveries.jsonl'
+RADIO_WATCH_HEARTBEAT = '/var/lib/travelpi/radio-watch-heartbeat'
+RADIO_WATCH_HEARTBEAT_TTL = 180
+MEMGUARD_LOG = '/var/lib/travelpi/mem-guard.jsonl'
+MEM_WATCH_HEARTBEAT = '/var/lib/travelpi/mem-watch-heartbeat'
+MEM_WATCH_HEARTBEAT_TTL = 120
+
+
+def radio_watchdog_status():
+    """Auto-recovery watchdog visibility: events logged by the recovery ladder,
+    last recovery time, and heartbeat liveness of the watch loop itself."""
+    count = 0
+    last = None
+    try:
+        for line in Path(RADIO_RECOVERY_LOG).read_text(errors='replace').splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            count += 1
+            try:
+                last = json.loads(line).get('ts')
+            except Exception:
+                pass
+    except OSError:
+        pass
+    return {'radio_recovery_events': count, 'last_radio_recovery': last,
+            'radio_watchdog': heartbeat_state(RADIO_WATCH_HEARTBEAT, RADIO_WATCH_HEARTBEAT_TTL)}
+
+
+def memguard_status():
+    """Memory/swap guard visibility: actions taken by the guard loop, last
+    action, and heartbeat liveness of the guard itself."""
+    count = 0
+    last = None
+    last_action = None
+    try:
+        for line in Path(MEMGUARD_LOG).read_text(errors='replace').splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            count += 1
+            try:
+                event = json.loads(line)
+                last = event.get('ts')
+                last_action = event.get('action')
+            except Exception:
+                pass
+    except OSError:
+        pass
+    return {'mem_guard_events': count, 'last_mem_guard_event': last,
+            'last_mem_guard_action': last_action,
+            'mem_watchdog': heartbeat_state(MEM_WATCH_HEARTBEAT, MEM_WATCH_HEARTBEAT_TTL)}
+
+
+def power_status():
+    result = {'state': 'unknown', 'temperature_c': None, 'throttled': None, 'detail': 'Power telemetry unavailable.'}
+    result['signal'] = 'unavailable'
+    result['raw_throttled'] = None
+    for field in THROTTLE_FLAG_FIELDS:
+        result[field] = None
+    result['core_volts'] = None
+    result['clock_synced'] = None
+    result['storage_risk'] = 'ok'
+    result['power_loss_count'] = None
+    result.update(current_sensor_reading())
+    result.update(usb_otg_status())
+    result.update(power_recorder_status())
+    result['clock_synced'] = clock_synced()
+    try:
+        result['governor'] = Path('/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor').read_text().strip()
+    except OSError:
+        result['governor'] = None
+    journal_events = journal_power_events()
+    if journal_events['fs_errors']:
+        result['storage_risk'] = 'high'
+    elif result['power_loss_count']:
+        result['storage_risk'] = 'elevated'
+    try:
+        temperature = text(['/usr/bin/vcgencmd', 'measure_temp'])
+        match = re.search(r'temp=([0-9.]+)', temperature)
+        if match:
+            result['temperature_c'] = float(match.group(1))
+    except Exception:
+        try:
+            result['temperature_c'] = round(int(Path('/sys/class/thermal/thermal_zone0/temp').read_text()) / 1000, 1)
+        except Exception:
+            pass
+    try:
+        volts = text(['/usr/bin/vcgencmd', 'measure_volts', 'core'])
+        result['core_volts'] = parse_core_volts(volts)
+    except Exception:
+        pass
+    try:
+        throttled = text(['/usr/bin/vcgencmd', 'get_throttled'])
+        match = re.search(r'0x([0-9a-f]+)', throttled, re.I)
+        if match:
+            value = int(match.group(1), 16)
+            decoded = decode_throttle_bits(value)
+            result['throttled'] = '0x' + format(value, 'x')
+            result['raw_throttled'] = result['throttled']
+            result['signal'] = decoded['signal']
+            for field in THROTTLE_FLAG_FIELDS:
+                result[field] = decoded[field]
+            result['state'] = 'ok' if decoded['signal'] == 'clean' else 'warning'
+            result['detail'] = THROTTLE_DETAILS[decoded['signal']]
+    except Exception:
+        pass
+    if result['state'] == 'unknown' and result['temperature_c'] is not None:
+        result['state'] = 'ok'
+        result['detail'] = 'Temperature is available; power flags are unavailable.'
+    if result['unexpected_shutdown'] is True:
+        if result['state'] == 'ok':
+            result['state'] = 'warning'
+        result['detail'] = ('Unexpected shutdown: the previous boot ended without a '
+                            'clean-shutdown marker (power loss). ' + result['detail'])
+    return result
+
+
+def pressure_status():
+    try:
+        load_1m = float(Path('/proc/loadavg').read_text().split()[0])
+    except Exception:
+        load_1m = None
+    memory = {}
+    try:
+        for line in Path('/proc/meminfo').read_text().splitlines():
+            key, value = line.split(':', 1)
+            if key == 'MemAvailable':
+                memory[key] = int(value.strip().split()[0]) // 1024
+                break
+    except Exception:
+        pass
+    available_mb = memory.get('MemAvailable')
+    pressured = (load_1m is not None and load_1m >= 4.0) or (available_mb is not None and available_mb < 64)
+    return {'load_1m': load_1m, 'memory_available_mb': available_mb, 'pressured': pressured}
+
+
+def subnet_overlaps():
+    """Warn when the WAN or wired uplink prefix collides with the AP LAN
+    (192.168.200.0/24) or with each other: a hotel handing out the same
+    range breaks forwarding and the subnet-router advertisement."""
+    nets = {}
+    for label, value in (('WAN ' + WAN, ipv4_address(WAN)), ('wired eth0', ipv4_address('eth0'))):
+        try:
+            if value:
+                nets[label] = ipaddress.ip_interface(value).network
+        except ValueError:
+            continue
+    ap_net = ipaddress.ip_interface(AP_ADDRESS).network
+    named = [('AP LAN ' + LAN, ap_net)] + list(nets.items())
+    warnings = []
+    for i, (name_a, net_a) in enumerate(named):
+        for name_b, net_b in named[i + 1:]:
+            if net_a.overlaps(net_b):
+                warnings.append('Subnet overlap: %s (%s) overlaps %s (%s)' % (name_a, net_a, name_b, net_b))
+    return warnings
+
+
+def health_status():
+    pressure = pressure_status()
+    load_1m = pressure.get('load_1m')
+    memory = {}
+    try:
+        for line in Path('/proc/meminfo').read_text().splitlines():
+            key, value = line.split(':', 1)
+            if key in ('MemAvailable', 'MemTotal', 'SwapFree', 'SwapTotal'):
+                memory[key] = int(value.strip().split()[0]) // 1024
+    except Exception:
+        pass
+    swap_total = memory.get('SwapTotal', 0)
+    swap_used = max(0, swap_total - memory.get('SwapFree', swap_total))
+    mem_total = memory.get('MemTotal', 0)
+    mem_available = memory.get('MemAvailable')
+    mem_used_percent = (round(100 * (mem_total - mem_available) / mem_total, 1)
+                        if mem_total and mem_available is not None else None)
+    swap_used_percent = (round(100 * swap_used / swap_total, 1) if swap_total else None)
+    try:
+        disk = shutil.disk_usage('/')
+        disk_used_percent = round((disk.used / disk.total) * 100, 1) if disk.total else None
+    except OSError:
+        disk_used_percent = None
+    journal_events = journal_power_events()
+    return {'load_1m': load_1m, 'memory_available_mb': memory.get('MemAvailable'),
+            'memory_total_mb': mem_total, 'swap_total_mb': swap_total,
+            'swap_free_mb': memory.get('SwapFree'),
+            'memory_used_percent': mem_used_percent, 'swap_used_percent': swap_used_percent,
+            'swap_used_mb': swap_used, 'disk_used_percent': disk_used_percent,
+            'portal': portal_status(),
+            'subnet_overlaps': subnet_overlaps(),
+            'pressured': pressure.get('pressured', False), 'power': power_status(),
+            'firmware_overrides': firmware_config_overrides(),
+            'throttle_events': journal_events['throttle_events'],
+            'radio_reset_events': journal_events['radio_reset_events'],
+            'radio_link_events': journal_events['radio_link_events'],
+            **radio_watchdog_status(),
+            **memguard_status()}
+
+
+def parse_tailscale_status(payload):
+    self_info = payload.get('Self') if isinstance(payload, dict) else {}
+    self_info = self_info if isinstance(self_info, dict) else {}
+    peers = payload.get('Peer', {}) if isinstance(payload, dict) else {}
+    peers = peers if isinstance(peers, dict) else {}
+    exit_status = payload.get('ExitNodeStatus', {}) if isinstance(payload, dict) else {}
+    exit_status = exit_status if isinstance(exit_status, dict) else {}
+    ips = self_info.get('TailscaleIPs') or []
+    peer_list = []
+    for peer in peers.values():
+        if not isinstance(peer, dict):
+            continue
+        peer_ips = peer.get('TailscaleIPs') or []
+        peer_list.append({
+            'name': peer.get('HostName') or str(peer.get('DNSName') or '').split('.')[0],
+            'ip': peer_ips[0] if peer_ips else None,
+            'online': bool(peer.get('Online')),
+        })
+    return {'state': payload.get('BackendState', 'unknown'),
+            'backend_state': payload.get('BackendState', 'unknown'),
+            'addresses': [str(ip) for ip in ips if isinstance(ip, str)],
+            'peer_count': len(peers),
+            'peers': peer_list[:16],
+            'exit_node': exit_status.get('HostName') or exit_status.get('ID'),
+            'exit_node_active': bool(exit_status.get('Online')),
+            'transport': 'relay' if any(isinstance(peer, dict) and peer.get('Relay') for peer in peers.values()) else 'direct-or-unknown',
+            'auth_url': payload.get('AuthURL'),
+            'needs_login': payload.get('BackendState') != 'Running'}
+
+
+def parse_wireguard_dump(output):
+    lines = [line.split('\t') for line in (output or '').splitlines() if line.strip()]
+    peers = lines[1:] if lines else []
+    routes = []
+    endpoints = []
+    latest_handshake = None
+    for peer in peers:
+        if len(peer) >= 3:
+            endpoints.append(peer[2]) if peer[2] else None
+        if len(peer) >= 4 and peer[3]:
+            routes.extend(item for item in peer[3].split(',') if item)
+        if len(peer) >= 5 and peer[4].isdigit():
+            latest_handshake = max(latest_handshake or 0, int(peer[4]))
+    return {'state': 'active' if lines else 'inactive', 'peer_count': len(peers),
+            'routes': routes, 'endpoints': endpoints, 'latest_handshake': latest_handshake}
+
+
+TAILSCALE_STATUS_CACHE = '/tmp/travelpi-%d-%s' % (os.geteuid(), 'tailscale-status.json')
+TAILSCALE_STATUS_TTL = 30
+
+
+def ap_wifi6():
+    """Whether the AP serves Wi-Fi 6 (HE): hostapd.conf ieee80211ax=1 is the
+    configured truth; when the config is unreadable (the unprivileged status
+    path), fall back to the radio's reported HE capability."""
+    try:
+        for line in HOSTAPD.read_text(errors='replace').splitlines():
+            if line.strip().startswith('ieee80211ax='):
+                return line.strip().split('=', 1)[1].strip() == '1'
+        return False
+    except OSError:
+        return 'wifi6' in (radio_phy_capabilities(LAN).get('capabilities') or [])
+
+
+def ap_evidence():
+    """Carrier and associated-station evidence for the AP interface — the unit
+    being active is not the same as the AP working (2026-10-27 incident: hostapd
+    'active' while wlan1 sat NO-CARRIER after the USB radio flapped)."""
+    carrier = None
+    try:
+        carrier = Path('/sys/class/net/' + LAN + '/carrier').read_text().strip() == '1'
+    except (OSError, ValueError):
+        pass
+    stations = None
+    try:
+        dump = text(['/usr/sbin/iw', 'dev', LAN, 'station', 'dump'], timeout=10)
+        stations = sum(1 for line in dump.splitlines() if line.startswith('Station '))
+    except Exception:
+        pass
+    return {'carrier': carrier, 'stations': stations}
+
+
+def cached_tailscale_status():
+    """Return Tailscale status JSON, cached briefly to avoid the slow CLI on every poll."""
+    cached = fresh_cache(TAILSCALE_STATUS_CACHE, ('payload',), TAILSCALE_STATUS_TTL)
+    if cached and isinstance(cached['payload'], dict):
+        return cached['payload']
+    payload = json_lines(text(['/usr/bin/tailscale', 'status', '--json'])) or {}
+    store_cache(TAILSCALE_STATUS_CACHE, payload=payload)
+    return payload
+
+
+def vpn_status():
+    states = {provider: service_state(unit) for provider, unit in VPN_UNITS.items()}
+    openvpn_state = service_state(OPENVPN_UNIT)
+    providers = {provider: {'provider': provider, 'state': states[provider], 'available': True}
+                 for provider in VPN_UNITS}
+    providers['openvpn'] = {'provider': 'openvpn', 'state': openvpn_state,
+                            'available': unit_available(OPENVPN_UNIT)}
+    if states['tailscale'] == 'active':
+        try:
+            payload = cached_tailscale_status() or {}
+            providers['tailscale'].update(parse_tailscale_status(payload))
+            providers['tailscale']['state'] = states['tailscale']
+        except Exception:
+            providers['tailscale']['detail_error'] = 'Provider detail unavailable'
+    if states['wireguard'] == 'active':
+        try:
+            details = parse_wireguard_dump(text(['/usr/bin/wg', 'show', 'wg0', 'dump']))
+            details.pop('state', None)
+            providers['wireguard'].update(details)
+            providers['wireguard']['addresses'] = [ipv4_address('wg0')] if ipv4_address('wg0') else []
+        except Exception:
+            providers['wireguard']['detail_error'] = 'Provider detail unavailable'
+    active = []
+    for provider, item in providers.items():
+        if item.get('state') != 'active':
+            continue
+        if provider == 'tailscale' and item.get('backend_state') not in (None, 'Running'):
+            continue
+        active.append(provider)
+    selected = active[0] if active else 'tailscale'
+    return {'selected': selected, 'states': states, 'active': active, 'providers': providers,
+            'summary': ', '.join(provider.title() for provider in active) if active else 'Off'}
+
+
+def ipv6_status():
+    def global_address(interface):
+        # A real global unicast address (2000::/3). ULAs (fc00::/7, including
+        # the ULA the AP advertises) also carry "scope global" in
+        # `ip`, so scope alone cannot tell the two apart.
+        try:
+            output = text(['/sbin/ip', '-6', '-o', 'addr', 'show', 'dev', interface, 'scope', 'global'])
+        except Exception:
+            return False
+        return bool(re.search(r'inet6\s+[23][0-9a-f]{0,3}:[0-9a-f:]*/', output, re.I))
+
+    try:
+        route = text(['/sbin/ip', '-6', 'route', 'show', 'default', 'dev', WAN])
+    except Exception:
+        route = ''
+    wan_global = global_address(WAN)
+    ap_global = global_address(LAN)
+    try:
+        ap_ula = bool(re.search(r'inet6\s+f[cd][0-9a-f]{0,2}:',
+                                text(['/sbin/ip', '-6', '-o', 'addr', 'show', 'dev', LAN, 'scope', 'global']), re.I))
+    except Exception:
+        ap_ula = False
+    ula_configured = ula_prefix() is not None
+    ra_off = Path(AP_RA_OFF_DROPIN).exists()
+    # RAs are live only when systemd-networkd (ADR 0006) is running and the
+    # installed AP profile exists; the ra-off drop-in switches them off.
+    networkd_up = service_state('systemd-networkd') == 'active' and Path(AP_NETWORK_FILE).exists()
+    ra_live = networkd_up and not ra_off
+    # ADR 0007: the DHCPv6-PD client is not implemented, so 'active'
+    # (delegated global addressing) is never claimed. ap_global / wan_global
+    # stay as observed facts.
+    if not ula_configured and not ap_ula and not ap_global:
+        state = 'off'
+        detail = ('No ULA prefix is configured (' + ULA_PREFIX_FILE + '); LAN devices get no IPv6 addresses '
+                  'until make deploy or travelpi-ula-init creates it.')
+    elif ra_live:
+        state = 'ula-only'
+        if wan_global:
+            detail = ('The WAN has global IPv6, but LAN devices only get ULA (private IPv6) addresses: '
+                      'no global prefix is delegated to the AP yet.')
+        else:
+            detail = 'Router advertisements are live: LAN devices get ULA (private IPv6) addresses; no global delegation yet.'
+    elif ra_off:
+        state = 'off'
+        detail = 'Router advertisements stopped; no IPv6 addressing advertised on the LAN.'
+    else:
+        state = 'off'
+        detail = ('Router advertisements are not running: systemd-networkd is not active or the AP profile ('
+                  + AP_NETWORK_FILE + ') is not installed.')
+    return {'state': state, 'detail': detail, 'wan_global': wan_global,
+            'ap_global': ap_global, 'default_route': bool(route), 'mutable': True}
+
+
+def status():
+    wan_link = parse_link(WAN)
+    ap = parse_ap(LAN)
+    mac = text(['/sbin/ip', 'link', 'show', WAN])
+    mac_match = re.search(r'link/ether\s+([0-9a-f:]{17})', mac, re.I)
+    current_mac = mac_match.group(1).lower() if mac_match else None
+    clone_mac = None
+    band_setting = None
+    profile = active_profile(WAN)
+    if profile:
+        band_setting = wan_band_setting(profile)
+        try:
+            clone_mac = text(['/usr/bin/nmcli', '-g', '802-11-wireless.cloned-mac-address',
+                              'connection', 'show', profile]) or None
+            if clone_mac:
+                clone_mac = clone_mac.strip().replace('\\:', ':')
+        except Exception:
+            clone_mac = None
+    radios = {'wan': interface_hardware(WAN), 'ap': interface_hardware(LAN)}
+    wan_state = 'connected' if wan_link else 'unknown'
+    return {
+        'ok': True,
+        'status': {
+            'wan': {'interface': WAN, 'state': wan_state, 'ssid': wan_link.get('ssid'),
+                    'ip': ipv4_address(WAN), 'gateway': route_status().get('gateway'),
+                    'signal_dbm': wan_link.get('signal_dbm'), 'freq': wan_link.get('freq'),
+                    'tx_bitrate': wan_link.get('tx_bitrate'), 'rx_bitrate': wan_link.get('rx_bitrate'),
+                    'band': band_for_frequency(wan_link.get('freq')), 'band_setting': band_setting},
+            'ap': {'interface': LAN, 'state': 'up' if ap.get('type') == 'AP' else 'unknown',
+                   'ssid': ap.get('ssid'), 'channel': ap.get('channel'), 'freq': ap.get('freq'),
+                   'width': ap.get('width'), 'txpower_dbm': ap.get('txpower_dbm'),
+                   'band': band_for_frequency(ap.get('freq')),
+                   'ip': ipv4_address(LAN), 'wifi6': ap_wifi6(),
+                   **ap_evidence()},
+            'currentWanMac': current_mac,
+            'wanMacClone': {'active': bool(clone_mac), 'address': clone_mac},
+            # Deprecated compatibility alias; it means current interface MAC.
+            'spoofedWanMac': current_mac,
+            'clients': clients(),
+            'defaultRoute': route_status(),
+            **network_health(),
+            'cake': cake_status(),
+            'dnsStack': adguard_dns_status(),
+            'ipv6': ipv6_status(),
+            'vpn': vpn_status(),
+            'wired': wired_uplink_status(),
+            'readiness': readiness_status(),
+            'radioInventory': radios,
+            # Deprecated compatibility alias for older dashboard clients.
+            'hardware': radios,
+            'health': health_status(),
+            'services': {
+                'NetworkManager': service_state('NetworkManager'),
+                'hostapd': service_state('hostapd'),
+                'dnsmasq': service_state('dnsmasq'),
+                'unbound': service_state('unbound'),
+                'adguard': adguard_dns_status()['service'],
+                'sqm': service_state(SQM_SERVICE),
+            },
+        },
+    }
+
+
+def confirm(request):
+    return request.get('confirm') is True
+
+
+def validate_mac(value):
+    value = str(value or '').lower()
+    if not MAC_RE.fullmatch(value):
+        raise ValueError('invalid MAC address')
+    first = int(value[:2], 16)
+    if first & 1 or not (first & 2):
+        raise ValueError('MAC must be a unicast locally administered address')
+    return value
+
+
+def wifi_profiles():
+    """Saved Wi-Fi profiles as {name, uuid, ssid, timestamp} (timestamp 0 = never activated)."""
+    try:
+        out = text(['/usr/bin/nmcli', '-t', '-f', 'NAME,UUID,TYPE', 'connection', 'show'])
+    except Exception:
+        return []
+    profiles = []
+    for line in out.splitlines():
+        parts = line.rsplit(':', 2)
+        if len(parts) != 3 or parts[2] != '802-11-wireless':
+            continue
+        name, uuid = parts[0].replace('\\:', ':'), parts[1]
+        try:
+            detail = text(['/usr/bin/nmcli', '-t', '-f', '802-11-wireless.ssid,connection.timestamp',
+                           'connection', 'show', 'uuid', uuid])
+        except Exception:
+            detail = ''
+        fields = {}
+        for row in detail.splitlines():
+            key, _, value = row.partition(':')
+            fields[key.strip()] = value.strip()
+        try:
+            timestamp = int(fields.get('connection.timestamp') or 0)
+        except ValueError:
+            timestamp = 0
+        profiles.append({'name': name, 'uuid': uuid,
+                         'ssid': fields.get('802-11-wireless.ssid', ''), 'timestamp': timestamp})
+    return profiles
+
+
+WRONG_PASSWORD_HINTS = ('secrets were required', 'no secrets', '4-way', 'handshake', 'wrong password',
+                        'invalid password', 'psk', 'authentication', 'password')
+
+
+def classify_connect_failure(password, result):
+    detail = ((result.stderr or '') + ' ' + (result.stdout or '')).lower()
+    if not password and ('secrets were required' in detail or 'password' in detail):
+        return 'password_required'
+    if password and any(hint in detail for hint in WRONG_PASSWORD_HINTS):
+        return 'wrong_password'
+    return 'connect_failed'
+
+
+def connect_hotel(request):
+    ssid = str(request.get('ssid') or '').strip()
+    password = str(request.get('password') or '')
+    if not ssid or len(ssid) > 32 or '\n' in ssid or '\r' in ssid:
+        return fail('invalid_ssid', 'Invalid hotel SSID')
+    if len(password) > 128 or '\n' in password or '\r' in password:
+        return fail('invalid_password', 'Invalid hotel password')
+    hidden = request.get('hidden', False)
+    if not isinstance(hidden, bool):
+        return fail('invalid_hidden', 'Hidden network flag must be true or false')
+    # --ask keeps the secret out of argv. NetworkManager may retain a profile
+    # according to its normal policy; the UI never displays or logs it.
+    previous_profile = active_profile(WAN)
+    # -w bounds the wait so a bad PSK fails in about 30 s instead of ~47 s.
+    argv = ['/usr/bin/nmcli', '-w', '30', '--ask', 'device', 'wifi', 'connect', ssid, 'ifname', WAN]
+    if hidden:
+        argv += ['hidden', 'yes']
+    profiles_before = wifi_profiles()
+    uuids_before = {profile['uuid'] for profile in profiles_before}
+
+    def delete_profile(profile):
+        run(['/usr/bin/nmcli', 'connection', 'delete', 'uuid', profile['uuid']], timeout=20)
+
+    if password:
+        # A profile that has never activated (timestamp 0) is leftover from a
+        # failed attempt: it would reuse its stale secret and ignore this
+        # password. Profiles that connected before stay authoritative.
+        for profile in profiles_before:
+            if profile['ssid'] == ssid and profile['timestamp'] == 0 and profile['name'] != previous_profile:
+                delete_profile(profile)
+
+    def rollback():
+        # Remove profiles this attempt created, or this SSID's profiles that
+        # never activated, so a bad password never persists. Profiles that
+        # connected before stay authoritative. Then bring the previous WAN back.
+        for profile in wifi_profiles():
+            created = profile['uuid'] not in uuids_before
+            stale = profile['ssid'] == ssid and profile['timestamp'] == 0
+            if created or stale:
+                delete_profile(profile)
+        if previous_profile:
+            run(['/usr/bin/nmcli', 'connection', 'up', previous_profile, 'ifname', WAN], timeout=45)
+
+    result = run(argv, input_text=(password + '\n') if password else '\n', timeout=50)
+    if result.returncode:
+        rollback()
+        code = classify_connect_failure(password, result)
+        if code == 'password_required':
+            return fail('password_required', 'That network needs a password; enter it and try again.')
+        if code == 'wrong_password':
+            return fail('wrong_password', 'The network rejected the password; check it and try again.')
+        return fail('connect_failed', 'Hotel Wi-Fi connection failed'
+                    + ('; the previous WAN was restored.' if previous_profile else '.'))
+    verification = probe()
+    state = verification.get('status')
+    if state not in {'INTERNET_OK', 'CAPTIVE_PORTAL', 'NO_INTERNET'}:
+        rollback()
+        return fail('wan_probe_failed', 'Hotel Wi-Fi connected but WAN verification failed; the previous WAN was restored')
+    if state == 'CAPTIVE_PORTAL':
+        message = 'Connected to hotel Wi-Fi, but a captive portal is blocking internet; sign in from a device.'
+    elif state == 'NO_INTERNET':
+        message = 'Connected to hotel Wi-Fi, but no internet was detected yet.'
+    else:
+        message = 'Hotel Wi-Fi connection completed'
+    return ok('connect_hotel', message, status()['status'])
+
+
+WAN_VERIFIED_STATES = {'INTERNET_OK', 'CAPTIVE_PORTAL', 'NO_INTERNET'}
+MAC_SETTING = '802-11-wireless.cloned-mac-address'
+
+
+def apply_wan_profile_setting(profile, setting, value, previous):
+    """Set one NetworkManager setting on the WAN profile, bounce the
+    connection, probe-verify, and put `previous` back on any failure.
+
+    Returns 'applied', 'applied_no_internet' (verified associated but the probe
+    saw NO_INTERNET), 'update_failed' (nothing changed), 'verify_failed'
+    (restored and reconnected) or 'unrestored' (the previous setting could not
+    be put back or the connection did not come back)."""
+    result = run(['/usr/bin/nmcli', 'connection', 'modify', profile, setting, value], timeout=30)
+    if result.returncode:
+        return 'update_failed'
+    run(['/usr/bin/nmcli', 'connection', 'down', profile], timeout=30)
+    result = run(['/usr/bin/nmcli', 'connection', 'up', profile, 'ifname', WAN], timeout=45)
+    verification = probe() if result.returncode == 0 else None
+    if result.returncode == 0 and verification.get('status') in WAN_VERIFIED_STATES:
+        return 'applied_no_internet' if verification.get('status') == 'NO_INTERNET' else 'applied'
+    restored = run(['/usr/bin/nmcli', 'connection', 'modify', profile, setting, previous], timeout=30)
+    run(['/usr/bin/nmcli', 'connection', 'down', profile], timeout=30)
+    reconnected = run(['/usr/bin/nmcli', 'connection', 'up', profile, 'ifname', WAN], timeout=45)
+    return 'unrestored' if (restored.returncode or reconnected.returncode) else 'verify_failed'
+
+
+def clone_mac(request):
+    profile = active_profile(WAN)
+    if not profile:
+        return fail('wan_not_connected', 'No active hotel connection on wlan0')
+    mode = str(request.get('mode') or 'specific')
+    if mode == 'default':
+        # Reset to hardware identity: clear any cloned/random MAC so the adapter
+        # uses its permanent burned-in address. Restores the clone if WAN dies.
+        value, saved = '', 'WAN MAC reset to the hardware default'
+        codes = ('mac_update_failed', 'Could not clear the WAN MAC setting',
+                 'mac_verify_failed', 'Reset to the hardware MAC broke connectivity; the previous setting was restored')
+    elif mode == 'random':
+        # Privacy mode: NetworkManager generates a fresh locally administered
+        # MAC per connection for this profile; no fixed identity per hotel.
+        value, saved = 'random', 'Hotel Wi-Fi now uses a randomized WAN MAC'
+        codes = ('mac_update_failed', 'Could not save the WAN MAC setting',
+                 'mac_verify_failed', 'Random WAN MAC broke connectivity; the previous setting was restored')
+    else:
+        try:
+            value = validate_mac(request.get('mac'))
+        except ValueError as error:
+            return fail('invalid_mac', str(error))
+        saved = 'WAN MAC clone applied'
+        codes = ('mac_update_failed', 'Could not save the WAN MAC clone',
+                 'wan_reconnect_failed', 'WAN verification failed; the previous MAC identity was restored')
+    try:
+        current = run(['/usr/bin/nmcli', '-g', MAC_SETTING, 'connection', 'show', profile])
+    except Exception:
+        current = None
+    if current is None or current.returncode:
+        # A failed read must not be mistaken for an empty (default) setting:
+        # that would "restore" the wrong identity if the change fails.
+        return fail('mac_update_failed', 'Could not read the current WAN MAC setting; nothing changed.')
+    previous = current.stdout.strip().replace('\\:', ':')
+    outcome = apply_wan_profile_setting(profile, MAC_SETTING, value, previous)
+    if outcome == 'update_failed':
+        return fail(codes[0], codes[1])
+    if outcome == 'verify_failed':
+        return fail(codes[2], codes[3])
+    if outcome == 'unrestored':
+        return fail(codes[2] + '_unrestored',
+                    'The WAN identity change failed and the previous setting could not be brought back; '
+                    'reconnect from the Hotel page.')
+    if outcome == 'applied_no_internet':
+        saved += ', but no internet was detected'
+    return ok('apply_mac_clone', saved, status()['status'])
+
+
+NM_BAND_VALUES = {'2.4ghz': 'bg', '5ghz': 'a', 'auto': ''}
+NM_BAND_NAMES = {'bg': '2.4ghz', 'a': '5ghz'}
+
+
+def wan_band_setting(profile):
+    """The NetworkManager band selector on the WAN profile: auto, 2.4ghz or
+    5ghz; None when it cannot be read."""
+    try:
+        value = text(['/usr/bin/nmcli', '-g', '802-11-wireless.band',
+                      'connection', 'show', profile]).strip()
+    except Exception:
+        return None
+    return NM_BAND_NAMES.get(value, 'auto' if not value else None)
+
+
+def set_wan_band(request):
+    """Pin the WAN association to one band via the active profile's
+    802-11-wireless.band (no secrets touched), then reactivate, verify with
+    the WAN probe and restore the previous setting on any failure."""
+    band = request.get('band')
+    if band not in ('auto', '2.4ghz', '5ghz', '6ghz'):
+        return fail('invalid_wan_band', 'Unsupported WAN band')
+    if band != 'auto':
+        reported = radio_phy_capabilities(WAN).get('bands') or []
+        if band not in reported:
+            return fail('band_unsupported',
+                        'The WAN radio has not reported ' + band + ' support; nothing changed.')
+        if band == '6ghz':
+            return fail('radio_capability_missing',
+                        'NetworkManager has no 6 GHz band selector, so the WAN band cannot be pinned to 6 GHz; nothing changed.')
+    profile = active_profile(WAN)
+    if not profile:
+        return fail('wan_not_connected', 'No active hotel connection on wlan0')
+    try:
+        previous = text(['/usr/bin/nmcli', '-g', '802-11-wireless.band',
+                         'connection', 'show', profile]).strip()
+    except Exception:
+        return fail('wan_band_failed', 'Could not read the current WAN band setting; nothing changed.')
+    outcome = apply_wan_profile_setting(profile, '802-11-wireless.band', NM_BAND_VALUES[band], previous)
+    if outcome == 'update_failed':
+        return fail('wan_band_failed', 'Could not save the WAN band setting; nothing changed.')
+    if outcome == 'unrestored':
+        return fail('wan_band_failed_unrestored',
+                    'The WAN band change failed and the previous connection could not be brought back; reconnect from the Hotel page.')
+    if outcome == 'verify_failed':
+        return fail('wan_band_failed', 'WAN verification failed on the requested band; the previous band setting was restored')
+    message = 'WAN band set to ' + ('automatic' if band == 'auto' else band)
+    if outcome == 'applied_no_internet':
+        message += ', but no internet was detected'
+    return ok('set_wan_band', message, status()['status'])
+
+
+def replace_setting(lines, key, value):
+    pattern = re.compile(r'^' + re.escape(key) + r'=')
+    for index, line in enumerate(lines):
+        if pattern.match(line):
+            lines[index] = key + '=' + value
+            return lines
+    lines.append(key + '=' + value)
+    return lines
+
+
+def radio_phy_capabilities(interface):
+    """Live capability read for one radio from iw phy info; empty shapes when
+    the read fails (callers then refuse rather than guess)."""
+    try:
+        phy_name = (DEVICE_SYS / interface / 'phy80211' / 'name').read_text().strip()
+        iw_info = text(['/sbin/iw', 'phy', phy_name, 'info']) if phy_name else ''
+        return parse_radio_capabilities(iw_info)
+    except Exception:
+        return {'bands': [], 'capabilities': [], 'supported_channels': {}}
+
+
+def ap_phy_capabilities():
+    """Live capability read for the AP radio from iw phy info; empty shapes
+    when the read fails (the helper then refuses channel picks rather than
+    guessing, per the honest-unavailable rule). Profiles the canonical AP
+    radio (wlan1); the arbitrary role swap stays gated (ADR-0002/0004),
+    so this is the radio set_ap_radio can move."""
+    return radio_phy_capabilities(LAN)
+
+
+def ap_profile(request):
+    profile = request.get('band')
+    if profile not in ('2.4ghz', '5ghz', '6ghz'):
+        return fail('invalid_ap_profile', 'Unsupported AP profile')
+    requested = request.get('channel')
+    caps = ap_phy_capabilities()
+    allowed = (caps.get('supported_channels') or {}).get(profile) or []
+    if profile == '6ghz' and not allowed:
+        return fail('radio_capability_missing',
+                    'The AP radio has not reported 6 GHz support; nothing changed.')
+    if requested is not None:
+        if not allowed:
+            return fail('radio_capability_missing',
+                        'The AP radio has not reported supported channels; leave the channel on Default.')
+        try:
+            channel = int(requested)
+        except (TypeError, ValueError):
+            return fail('invalid_ap_channel', 'AP channel must be a number')
+        if channel not in allowed:
+            return fail('invalid_ap_channel',
+                        'Channel ' + str(channel) + ' is not available on the AP radio'
+                        + (' (available: ' + ', '.join(str(c) for c in allowed) + ')' if allowed else '')
+                        + '; it is radar (DFS)-excluded or unsupported by the hardware.')
+    elif profile == '2.4ghz':
+        channel = 6
+    elif profile == '5ghz':
+        channel = 36
+    else:
+        channel = min(allowed)
+    try:
+        lines = HOSTAPD.read_text().splitlines()
+    except Exception:
+        return fail('hostapd_config_missing', 'hostapd configuration is unavailable')
+    lines = replace_setting(lines, 'hw_mode', 'g' if profile == '2.4ghz' else 'a')
+    lines = replace_setting(lines, 'channel', str(channel))
+    lines = replace_setting(lines, 'ieee80211n', '1')
+    lines = replace_setting(lines, 'wmm_enabled', '1')
+    lines = replace_setting(lines, 'ieee80211ac', '1' if profile == '5ghz' else '0')
+    lines = replace_setting(lines, 'ieee80211ax', '1' if profile in ('5ghz', '6ghz') else '0')
+    lines = replace_setting(lines, 'he_6ghz', '1' if profile == '6ghz' else '0')
+    # 6 GHz bands require management frame protection; hostapd refuses the
+    # band without ieee80211w=2. Other bands stay at 1 (supported, optional),
+    # which is hostapd's default behavior for WPA2-PSK.
+    lines = replace_setting(lines, 'ieee80211w', '2' if profile == '6ghz' else '1')
+    backup = HOSTAPD.with_suffix('.conf.travelpi-backup')
+    try:
+        shutil.copy2(HOSTAPD, backup)
+        HOSTAPD.write_text('\n'.join(lines) + '\n')
+        result = run(['/bin/systemctl', 'restart', 'hostapd'], timeout=30)
+    except Exception:
+        return fail('ap_update_failed', 'Could not update the AP profile')
+    if result.returncode:
+        restored = True
+        try:
+            shutil.copy2(backup, HOSTAPD)
+            run(['/bin/systemctl', 'restart', 'hostapd'], timeout=30)
+        except Exception:
+            restored = False
+        if not restored:
+            return fail('ap_restart_failed_unrestored',
+                        'AP profile failed to apply and the previous hostapd configuration could not be '
+                        'restored. Repair the radios or restore ' + str(backup) + ' before relying on the AP.')
+        return fail('ap_restart_failed', 'AP profile was not verified; the previous profile was restored')
+    return ok('set_ap_radio', 'TravelPi AP profile applied')
+
+
+def set_ap_identity(request):
+    """Change the AP broadcast name and/or WPA password (WPA2-PSK stays the
+    only mode). The passphrase arrives via stdin JSON (never argv), is
+    written only into hostapd.conf (root 0600), never appears in any
+    response, status payload, or log, and is never stored by the dashboard.
+    Restore-on-fail mirrors ap_profile."""
+    ssid = request.get('ssid')
+    passphrase = request.get('passphrase')
+    if ssid is None and passphrase is None:
+        return fail('invalid_ap_identity', 'Provide a new AP name, a new password, or both')
+    if ssid is not None:
+        if not isinstance(ssid, str) or not (1 <= len(ssid.encode('utf-8')) <= 32) or re.search(r'[\x00-\x1f\x7f]', ssid):
+            return fail('invalid_ap_identity', 'AP name must be 1-32 bytes of printable characters')
+        if ssid != ssid.lstrip(' \t'):
+            return fail('invalid_ap_identity', 'AP name must not start with a space (hostapd strips it)')
+    if passphrase is not None:
+        if not isinstance(passphrase, str) or not passphrase.isascii() or not (8 <= len(passphrase) <= 63) or re.search(r'[\x00-\x1f\x7f]', passphrase):
+            return fail('invalid_ap_identity', 'AP password must be 8-63 printable ASCII characters')
+        # hostapd strips leading whitespace from wpa_passphrase and treats a
+        # leading double quote as a C-style quoted value; refuse the inputs
+        # whose effective secret would differ from what was typed.
+        if passphrase != passphrase.strip() or passphrase.startswith('"'):
+            return fail('invalid_ap_identity',
+                        'AP password must not start with a quote or carry leading/trailing spaces')
+    try:
+        lines = HOSTAPD.read_text().splitlines()
+    except Exception:
+        return fail('hostapd_config_missing', 'hostapd configuration is unavailable')
+    if ssid is not None:
+        lines = replace_setting(lines, 'ssid', ssid)
+    if passphrase is not None:
+        lines = replace_setting(lines, 'wpa_passphrase', passphrase)
+        lines = replace_setting(lines, 'wpa', '2')
+        lines = replace_setting(lines, 'wpa_key_mgmt', 'WPA-PSK')
+    backup = HOSTAPD.with_suffix('.conf.travelpi-backup')
+    try:
+        shutil.copy2(HOSTAPD, backup)
+        HOSTAPD.write_text('\n'.join(lines) + '\n')
+        result = run(['/bin/systemctl', 'restart', 'hostapd'], timeout=30)
+    except Exception:
+        return fail('ap_identity_failed', 'Could not update the AP identity')
+    if result.returncode:
+        restored = True
+        try:
+            shutil.copy2(backup, HOSTAPD)
+            run(['/bin/systemctl', 'restart', 'hostapd'], timeout=30)
+        except Exception:
+            restored = False
+        if not restored:
+            return fail('ap_identity_failed_unrestored',
+                        'The AP did not come up with the new identity and the previous hostapd configuration '
+                        'could not be restored. Restore ' + str(backup) + ' before relying on the AP.')
+        return fail('ap_identity_failed',
+                    'The AP did not come up with the new identity; the previous configuration was restored')
+    return ok('set_ap_identity', 'AP identity updated')
+
+
+def set_conf_interface_setting(lines, new_iface):
+    out = []
+    found = False
+    for line in lines:
+        if line.startswith('interface='):
+            out.append('interface=' + new_iface)
+            found = True
+        else:
+            out.append(line)
+    if not found:
+        out.append('interface=' + new_iface)
+    return out
+
+
+def wifi_radio_interfaces():
+    radios = []
+    try:
+        out = text(['/usr/bin/nmcli', '-t', '-f', 'DEVICE,TYPE', 'device', 'status'])
+    except Exception:
+        return radios
+    for line in out.splitlines():
+        parts = line.split(':', 1)
+        if len(parts) == 2 and parts[1] == 'wifi':
+            radios.append(parts[0])
+    return radios
+
+
+def find_wan_connection(ap_iface):
+    wan_radio = None
+    for r in wifi_radio_interfaces():
+        if r and r != ap_iface:
+            wan_radio = r
+            break
+    if not wan_radio:
+        return None
+    candidates = []
+    try:
+        out = text(['/usr/bin/nmcli', '-t', '-f', 'NAME,TYPE', 'connection', 'show'])
+        for line in out.splitlines():
+            parts = split_terse(line)
+            if len(parts) == 2 and parts[1] == '802-11-wireless':
+                candidates.append(parts[0])
+    except Exception:
+        return None
+    if not candidates:
+        return None
+    for name in candidates:
+        try:
+            bound = text(['/usr/bin/nmcli', '-g', 'connection.interface-name',
+                          'connection', 'show', name]).strip()
+        except Exception:
+            bound = ''
+        if bound == wan_radio:
+            return name
+    for name in candidates:
+        try:
+            bound = text(['/usr/bin/nmcli', '-g', 'connection.interface-name',
+                          'connection', 'show', name]).strip()
+        except Exception:
+            bound = ''
+        if bound == ap_iface:
+            return name
+    try:
+        out = text(['/usr/bin/nmcli', '-t', '-f', 'NAME,DEVICE,TYPE', 'connection', 'show', '--active'])
+        for line in out.splitlines():
+            parts = split_terse(line)
+            if len(parts) == 3 and parts[2] == '802-11-wireless' and parts[1]:
+                return parts[0]
+    except Exception:
+        pass
+    return None
+
+
+def down_all_wifi_stations():
+    try:
+        out = text(['/usr/bin/nmcli', '-t', '-f', 'NAME,TYPE', 'connection', 'show', '--active'])
+    except Exception:
+        return
+    for line in out.splitlines():
+        parts = split_terse(line)
+        if len(parts) == 2 and parts[1] == '802-11-wireless':
+            run(['/usr/bin/nmcli', 'connection', 'down', parts[0]], timeout=20)
+
+
+def ensure_wan_spoof(wan_conn):
+    if not wan_conn:
+        return
+    # A failed read is not "unset": leave a real clone alone rather than
+    # overwrite it with a random one.
+    try:
+        result = run(['/usr/bin/nmcli', '-g', '802-11-wireless.cloned-mac-address',
+                      'connection', 'show', wan_conn])
+    except Exception:
+        return
+    if result.returncode != 0:
+        return
+    current = (result.stdout or '').strip()
+    if not current or current.lower() in ('permanent', 'preserve'):
+        run(['/usr/bin/nmcli', 'connection', 'modify', wan_conn,
+             '802-11-wireless.cloned-mac-address', 'random'])
+
+
+def apply_radio_layout(ap_iface, wan_iface, ap_hw_mode, ap_channel, ap_ac, ap_ax):
+    try:
+        current = HOSTAPD.read_text().splitlines()
+    except Exception:
+        return fail('hostapd_config_missing', 'hostapd configuration is unavailable')
+    try:
+        dnsmasq_path = DNSMASQ_CONF
+        dnsmasq_lines = set_conf_interface_setting(dnsmasq_path.read_text().splitlines(), ap_iface)
+    except Exception:
+        return fail('dnsmasq_config_missing', 'dnsmasq configuration is unavailable')
+    new_lines = set_conf_interface_setting(current, ap_iface)
+    new_lines = replace_setting(new_lines, 'hw_mode', ap_hw_mode)
+    new_lines = replace_setting(new_lines, 'channel', ap_channel)
+    new_lines = replace_setting(new_lines, 'ieee80211ac', ap_ac)
+    new_lines = replace_setting(new_lines, 'ieee80211ax', ap_ax)
+    backup = HOSTAPD.with_suffix('.conf.travelpi-backup')
+    dnsmasq_backup = dnsmasq_path.with_suffix('.conf.travelpi-backup')
+    try:
+        shutil.copy2(HOSTAPD, backup)
+        shutil.copy2(dnsmasq_path, dnsmasq_backup)
+        HOSTAPD.write_text(chr(10).join(new_lines) + chr(10))
+        dnsmasq_path.write_text(chr(10).join(dnsmasq_lines) + chr(10))
+    except Exception:
+        return fail('radio_config_failed', 'Could not rewrite interface configuration')
+
+    # Tear down any AP and Wi-Fi stations so one radio is never both AP and STA,
+    # and the cloned WAN MAC cannot appear on two interfaces at once.
+    run(['/bin/systemctl', 'stop', 'hostapd'], timeout=20)
+    run(['/bin/systemctl', 'stop', 'dnsmasq'], timeout=20)
+    down_all_wifi_stations()
+
+    # Hand the AP radio to hostapd/dnsmasq and assign the AP address.
+    # IPv4-scoped flush: a family-blind flush wipes the IPv6 link-local
+    # address, and radvd must advertise from a link-local source (2026-10-30
+    # ULA incident; see ensure_ipv6_link_local).
+    run(['/usr/bin/nmcli', 'device', 'set', ap_iface, 'managed', 'no'], timeout=20)
+    run(['/sbin/ip', 'link', 'set', ap_iface, 'up'], timeout=20)
+    run(['/sbin/ip', '-4', 'addr', 'flush', 'dev', ap_iface], timeout=20)
+    run(['/sbin/ip', 'addr', 'add', AP_ADDRESS, 'dev', ap_iface], timeout=20)
+    ensure_ipv6_link_local(ap_iface)
+    gateway = ap_v6_gateway()
+    if gateway:
+        run(['/sbin/ip', '-6', 'addr', 'add', gateway, 'dev', ap_iface], timeout=20)
+
+    # Turn the WAN radio OFF during the transition to avoid a cloned-MAC spoof split.
+    run(['/usr/bin/nmcli', 'device', 'set', wan_iface, 'managed', 'yes'], timeout=20)
+    run(['/sbin/ip', 'link', 'set', wan_iface, 'down'], timeout=20)
+
+    run(['/bin/systemctl', 'restart', 'hostapd'], timeout=30)
+    run(['/bin/systemctl', 'restart', 'dnsmasq'], timeout=30)
+    # radvd binds its interface and source address at startup; restart it so
+    # the freshly assigned link-local/gateway addresses take effect.
+    run(['/bin/systemctl', 'restart', 'systemd-networkd'], timeout=20)
+    time.sleep(3)
+    if run(['/bin/systemctl', 'is-active', 'hostapd']).returncode != 0:
+        restored = True
+        try:
+            # Restore both interface owners: leaving dnsmasq on the new radio
+            # while hostapd returns to the old one splits the AP in half.
+            shutil.copy2(backup, HOSTAPD)
+            shutil.copy2(dnsmasq_backup, dnsmasq_path)
+            run(['/bin/systemctl', 'restart', 'hostapd'], timeout=30)
+            run(['/bin/systemctl', 'restart', 'dnsmasq'], timeout=30)
+            run(['/bin/systemctl', 'restart', 'systemd-networkd'], timeout=20)
+            # The abandoned AP interface returns to WAN duty; drop the
+            # gateway addresses it was given during the failed flip so the
+            # keeper (which follows hostapd.conf) never has to chase them.
+            run(['/sbin/ip', '-4', 'addr', 'flush', 'dev', ap_iface], timeout=20)
+            run(['/sbin/ip', '-6', 'addr', 'flush', 'dev', ap_iface], timeout=20)
+        except Exception:
+            restored = False
+        if not restored:
+            return fail('ap_restart_failed_unrestored',
+                        'The AP did not come up on the new radio and the previous hostapd/dnsmasq configuration '
+                        'could not be restored. Repair the radios or restore ' + str(backup) + ' and ' +
+                        str(dnsmasq_backup) + ' before relying on the AP.')
+        return fail('ap_restart_failed', 'The AP did not come up on the new radio; the previous configuration was restored')
+    return None
+
+
+def wan_flip(request):
+    # CONTEXT.md: a safe role swap needs a verified LAN uplink and rollback
+    # testing. Until readiness proves that, refuse honestly instead of
+    # executing a swap the host has not demonstrated it can survive.
+    role_switch = readiness_status()['role_switch']
+    if not role_switch['available']:
+        return fail('unavailable', role_switch['reason'])
+    try:
+        ap_iface = None
+        for line in HOSTAPD.read_text().splitlines():
+            if line.startswith('interface='):
+                ap_iface = line.split('=', 1)[1].strip()
+                break
+    except Exception:
+        return fail('hostapd_config_missing', 'hostapd configuration is unavailable')
+    if not ap_iface:
+        return fail('wan_flip_failed', 'Could not determine the current AP interface')
+    radios = [r for r in wifi_radio_interfaces() if r and r != ap_iface]
+    if not radios:
+        return fail('wan_flip_failed', 'A radio role swap needs two or more Wi-Fi radios')
+    new_ap = radios[0]
+    new_wan = ap_iface
+    bands = interface_hardware(new_ap).get('bands') or []
+    if '5ghz' in bands:
+        ap_hw_mode, ap_channel, ap_ac, ap_ax = 'a', '36', '1', '1'
+    else:
+        ap_hw_mode, ap_channel, ap_ac, ap_ax = 'g', '6', '0', '0'
+    err = apply_radio_layout(new_ap, new_wan, ap_hw_mode, ap_channel, ap_ac, ap_ax)
+    if err:
+        return err
+    wan_conn = find_wan_connection(new_ap)
+    if wan_conn:
+        ensure_wan_spoof(wan_conn)
+        run(['/usr/bin/nmcli', 'connection', 'modify', wan_conn, 'connection.interface-name', new_wan])
+        run(['/usr/bin/nmcli', 'connection', 'up', wan_conn, 'ifname', new_wan], timeout=40)
+    return ok('wan_flip', 'Radio roles swapped: AP on ' + new_ap + ', WAN on ' + new_wan, status()['status'])
+
+
+def parse_rate(value):
+    match = RATE_RE.fullmatch(str(value or '').strip())
+    if not match:
+        raise ValueError('invalid CAKE rate')
+    number = float(match.group(1))
+    unit = (match.group(2) or 'mbit').lower()
+    factor = {'kbit': 1, 'kbps': 1, 'mbit': 1000, 'mbps': 1000,
+              'gbit': 1000000, 'gbps': 1000000}[unit]
+    rate = int(number * factor)
+    if rate < 100 or rate > 1000000:
+        raise ValueError('CAKE rate must be between 0.1 and 1000 Mbps')
+    return rate, str(rate) + 'kbit'
+
+
+def sqm_environment(rate):
+    # Manual pin: an explicit rate from the dashboard disables the auto-tuner.
+    return 'TRAVELPI_SQM_RATE=' + str(rate) + '\nTRAVELPI_SQM_AUTOTUNE=no\n'
+
+
+def write_private_file(path, content, mode=0o600):
+    """Write a file atomically without following a pre-planted symlink.
+
+    The helper runs as root, and several of these paths live in /tmp where any
+    local user can plant a symlink. mkstemp + os.replace creates a fresh file
+    and renames it into place, so a planted link is replaced rather than
+    written through. Raises on failure: callers must report what they could
+    not persist instead of claiming success.
+    """
+    target = str(path)
+    directory = os.path.dirname(target) or '.'
+    fd, temporary = tempfile.mkstemp(prefix='.travelpi-', dir=directory, text=True)
+    try:
+        with os.fdopen(fd, 'w') as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, mode)
+        os.replace(temporary, target)
+    except Exception:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+
+
+def read_private_cache(path, required_keys):
+    """Parsed dict from a /tmp cache file, or None unless the file is
+    trustworthy: a regular file (never a symlink), owned by root or by this
+    process's own euid (root whenever the helper is privileged), mode exactly
+    0600, JSON object carrying every required key. Anything else is ignored
+    and the caller recomputes, so a planted or corrupted /tmp file cannot feed
+    the dashboard."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid not in (0, os.geteuid())
+                or stat.S_IMODE(info.st_mode) != 0o600 or info.st_size > 1048576):
+            return None
+        with os.fdopen(fd, 'r', errors='replace') as handle:
+            fd = None
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    finally:
+        if fd is not None:
+            os.close(fd)
+    if not isinstance(data, dict) or any(key not in data for key in required_keys):
+        return None
+    return data
+
+
+def fresh_cache(path, required_keys, ttl):
+    """The cache's payload while younger than ttl seconds on the monotonic
+    clock (this board has no RTC; wall time jumps at boot and at NTP sync), or
+    None. A future stamp (stale file from another boot) counts as expired."""
+    cached = read_private_cache(path, ('_cached_at',) + tuple(required_keys))
+    stamp = cached.get('_cached_at') if cached else None
+    if isinstance(stamp, bool) or not isinstance(stamp, (int, float)):
+        return None
+    return cached if 0 <= time.monotonic() - stamp <= ttl else None
+
+
+def store_cache(path, **fields):
+    try:
+        write_private_file(path, json.dumps({'_cached_at': time.monotonic(), **fields}), 0o600)
+    except Exception:
+        pass
+
+
+def heartbeat_state(path, ttl):
+    """absent / armed / stale from a shell-touched heartbeat file's mtime.
+    Wall-clock mtimes can sit in the future after a clock step back; a
+    negative age is clamped to 0 (fresh) rather than flipping the status."""
+    try:
+        age = max(0.0, time.time() - os.path.getmtime(path))
+    except OSError:
+        return 'absent'
+    return 'armed' if age < ttl else 'stale'
+
+
+def persist_sqm_rate(rate):
+    write_private_file(SQM_ENV_FILE, sqm_environment(rate), 0o644)
+
+
+def cake_rate(request):
+    try:
+        value = request.get('rate_kbit')
+        if isinstance(value, bool) or not re.fullmatch(r'[0-9]+', str(value or '')):
+            raise ValueError('CAKE rate must be an integer in kbit/s')
+        rate_kbit = int(value)
+        if rate_kbit < 100 or rate_kbit > 1000000:
+            raise ValueError('CAKE rate must be between 100 and 1000000 kbit/s')
+        rate = str(rate_kbit) + 'kbit'
+    except ValueError as error:
+        return fail('invalid_cake_rate', str(error))
+
+    # Keep the previous working rate available. Restarting the oneshot SQM
+    # unit briefly removes qdiscs; never report success unless the route and
+    # CAKE qdisc are healthy again, and attempt to restore the old rate if not.
+    # The unit reads TRAVELPI_SQM_RATE from EnvironmentFile, and an
+    # EnvironmentFile overrides anything set with `systemctl set-environment`,
+    # so the file must be written *before* the restart or the old rate applies.
+    # Snapshot the whole env file (it also carries TRAVELPI_SQM_AUTOTUNE and
+    # anything else in it) so a failed apply restores it byte for byte instead
+    # of rewriting it from a rate alone. None means the file did not exist.
+    try:
+        previous_env = Path(SQM_ENV_FILE).read_text()
+    except FileNotFoundError:
+        previous_env = None
+    except OSError:
+        return fail('cake_persist_failed', 'The current SQM settings could not be read; nothing was changed')
+    try:
+        persist_sqm_rate(rate)
+    except Exception:
+        return fail('cake_persist_failed', 'CAKE rate could not be saved; nothing was changed')
+    result = run(['/bin/systemctl', 'restart', SQM_SERVICE], timeout=30)
+    current = status()['status'] if result.returncode == 0 else None
+    healthy = bool(current and current.get('defaultRoute', {}).get('interface') == WAN and
+                   current.get('cake', {}).get('state') == 'active' and
+                   service_state(SQM_SERVICE) == 'active')
+
+    if not healthy:
+        # Put the previous env file back (or remove the one we created), then
+        # restart so the previous rate applies again. A new rate never stays
+        # persisted after a failed apply, even when CAKE was inactive before.
+        try:
+            if previous_env is None:
+                Path(SQM_ENV_FILE).unlink(missing_ok=True)
+            else:
+                write_private_file(SQM_ENV_FILE, previous_env, 0o644)
+        except OSError:
+            return fail('cake_restart_failed_unrestored',
+                        'CAKE was not verified after restart and the previous SQM settings could not be restored; '
+                        'check ' + SQM_ENV_FILE + '.')
+        run(['/bin/systemctl', 'restart', SQM_SERVICE], timeout=30)
+        return fail('cake_restart_failed', 'CAKE was not verified after restart; previous settings were restored')
+    applied = (current or {}).get('cake', {}).get('rate')
+    try:
+        applied_kbit = parse_rate(applied)[0] if applied else None
+    except ValueError:
+        applied_kbit = None
+    if applied_kbit is None or int(applied_kbit) != rate_kbit:
+        # The qdisc is healthy but not at the requested rate: say which is true.
+        return ok('set_cake_rate', 'CAKE is active at ' + str(applied or 'an unknown rate') +
+                  '; the requested ' + str(rate_kbit) + ' kbit/s is saved for the next CAKE restart.', current)
+    return ok('set_cake_rate', 'CAKE rate set to ' + str(rate_kbit) + ' kbit/s', current)
+
+
+def vpn_toggle(request):
+    provider = str(request.get('provider') or '')
+    enabled = request.get('enabled')
+    if provider not in VPN_UNITS or not isinstance(enabled, bool):
+        return fail('invalid_vpn_request', 'Unsupported VPN provider or state')
+    unit = VPN_UNITS[provider]
+    verb = ['enable', '--now'] if enabled else ['disable', '--now']
+    result = run(['/bin/systemctl', *verb, unit], timeout=30)
+    if result.returncode:
+        return fail('vpn_toggle_failed', provider.title() + ' could not be changed')
+    return ok('vpn_toggle', provider.title() + (' enabled' if enabled else ' disabled'), status()['status'])
+
+
+def tailscale_auth(request):
+    authkey = str(request.get('authkey') or '').strip()
+    try:
+        if os.path.exists(TAILSCALE_STATUS_CACHE):
+            os.remove(TAILSCALE_STATUS_CACHE)
+    except OSError:
+        pass
+    if not authkey:
+        return fail('authkey_required', 'Provide a Tailscale auth key; nothing was changed.')
+    if re.search(r'[\x00-\x20\x7f]', authkey) or len(authkey) > 256:
+        return fail('invalid_authkey', 'Tailscale auth key has invalid characters; nothing was changed.')
+    # The key goes through a 0600 file, never argv (argv is world-readable in /proc).
+    fd, key_path = tempfile.mkstemp(prefix='travelpi-ts-', dir='/run' if os.path.isdir('/run') else None)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, 'w') as handle:
+            handle.write(authkey + '\n')
+        result = run(['/usr/bin/tailscale', 'login', '--auth-key=file:' + key_path], timeout=60)
+    finally:
+        try:
+            os.remove(key_path)
+        except OSError:
+            pass
+    if result.returncode:
+        return fail('tailscale_auth_failed', 'Tailscale authentication could not be started')
+    return ok('tailscale_auth', 'Tailscale authentication requested', status()['status'])
+
+
+def restart_services(request):
+    targets = request.get('targets')
+    if not isinstance(targets, list) or not targets or any(not isinstance(target, str) or target not in {'ap', 'sqm'} for target in targets):
+        return fail('invalid_targets', 'Only the ap and sqm services may be restarted')
+    for target in targets:
+        unit = 'hostapd' if target == 'ap' else SQM_SERVICE
+        result = run(['/bin/systemctl', 'restart', unit], timeout=30)
+        if result.returncode:
+            return fail('restart_failed', target.upper() + ' restart failed')
+    return ok('restart_services', 'Requested services restarted')
+
+
+def reset_radios(request):
+    radios = wifi_radio_interfaces()
+    if len(radios) < 2:
+        return fail('reset_radios_failed', 'Two or more Wi-Fi radios are required')
+    ap_iface = None
+    for r in radios:
+        bands = interface_hardware(r).get('bands') or []
+        if '5ghz' in bands and not ap_iface:
+            ap_iface = r
+    if not ap_iface:
+        ap_iface = radios[0]
+    wan_iface = None
+    for r in radios:
+        if r != ap_iface:
+            wan_iface = r
+            break
+    if not wan_iface:
+        return fail('reset_radios_failed', 'Could not choose a WAN radio')
+    bands = interface_hardware(ap_iface).get('bands') or []
+    if '5ghz' in bands:
+        ap_hw_mode, ap_channel, ap_ac, ap_ax = 'a', '36', '1', '1'
+    else:
+        ap_hw_mode, ap_channel, ap_ac, ap_ax = 'g', '6', '0', '0'
+    err = apply_radio_layout(ap_iface, wan_iface, ap_hw_mode, ap_channel, ap_ac, ap_ax)
+    if err:
+        return err
+    wan_conn = find_wan_connection(ap_iface)
+    if wan_conn:
+        ensure_wan_spoof(wan_conn)
+        run(['/usr/bin/nmcli', 'connection', 'modify', wan_conn, 'connection.interface-name', wan_iface])
+        run(['/usr/bin/nmcli', 'connection', 'up', wan_conn, 'ifname', wan_iface], timeout=40)
+    return ok('reset_radios', 'Radios repaired: AP on ' + ap_iface + ', WAN on ' + wan_iface, status()['status'])
+
+
+def wake_peer(request):
+    """Wake-on-LAN through the tailnet: Tailscale magic packet to a peer.
+    Target is a peer name or tailnet address, allowlisted to those shapes."""
+    target = str(request.get('target', ''))
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9.-]{0,63}', target):
+        return fail('invalid_target', 'Wake target must be a tailnet peer name or address')
+    result = run(['/usr/bin/tailscale', 'wakeonlan', target], timeout=30)
+    if result.returncode != 0:
+        return fail('wake_failed', 'Magic packet refused by Tailscale (is the peer a tailnet node?)')
+    return ok('wake_peer', 'Magic packet sent to ' + target)
+
+
+DNS_MODE_FILE = '/etc/default/travelpi-dns'
+UNBOUND_FRONT_CONF = '/etc/unbound/unbound.conf.d/travelpi-front.conf'
+CPU_GOVERNORS = ('conservative', 'ondemand', 'performance')
+
+
+def dns_stack_mode():
+    try:
+        line = Path(DNS_MODE_FILE).read_text(errors='replace')
+        match = re.search(r'TRAVELPI_DNS_MODE=(\w+)', line)
+        if match and match.group(1) in ('adguard', 'unbound'):
+            return match.group(1)
+    except OSError:
+        pass
+    return 'adguard'
+
+
+def usable_upstream(value):
+    """True for a routable IPv4 nameserver: not loopback (our own stub or
+    Unbound), not the tailnet resolver, not IPv6."""
+    try:
+        address = ipaddress.ip_address(str(value).strip())
+    except ValueError:
+        return False
+    return (address.version == 4 and not address.is_loopback and not address.is_unspecified
+            and str(address) != '100.100.100.100')
+
+
+def wan_nameservers():
+    """Hotel DHCP nameservers: prefer NetworkManager's IP4.DNS for the WAN,
+    then /etc/resolv.conf, filtered so we never forward to ourselves."""
+    found = []
+    try:
+        out = text(['/usr/bin/nmcli', '-t', '-f', 'IP4.DNS', 'device', 'show', WAN])
+        for line in out.splitlines():
+            if line.startswith('IP4.DNS') and ':' in line:
+                found.append(line.split(':', 1)[1].strip())
+    except Exception:
+        found = []
+    if not any(usable_upstream(item) for item in found):
+        try:
+            resolv = Path('/etc/resolv.conf').read_text(errors='replace')
+            found = [line.split()[1] for line in resolv.splitlines()
+                     if line.startswith('nameserver ') and len(line.split()) > 1]
+        except OSError:
+            found = []
+    result = []
+    for item in found:
+        if usable_upstream(item) and item not in result:
+            result.append(item)
+    return result[:3]
+
+
+def set_dns_stack(request):
+    """Toggle the DNS front door: AdGuard filtering (Unbound as fallback on
+    5335) versus plain recursive Unbound on :53 with the hotel nameservers."""
+    service = str(request.get('service') or '')
+    if service not in ('adguard', 'unbound'):
+        return fail('invalid_service', 'DNS stack must be adguard or unbound')
+    upstream = str(request.get('upstream') or '')
+    ns_list = []
+    for item in upstream.replace(',', ' ').split():
+        if not re.fullmatch(r'\d{1,3}(\.\d{1,3}){3}', item):
+            return fail('invalid_upstream', 'Upstream nameserver must be an IPv4 address')
+        ns_list.append(item)
+    if not ns_list:
+        ns_list = wan_nameservers()
+
+    def write_mode(mode):
+        try:
+            write_private_file(DNS_MODE_FILE, 'TRAVELPI_DNS_MODE=' + mode + '\n', 0o644)
+            return True
+        except OSError:
+            return False
+
+    if service == 'adguard':
+        try:
+            Path(UNBOUND_FRONT_CONF).unlink(missing_ok=True)
+        except OSError:
+            pass
+        persisted = write_mode('adguard')
+        unbound_up = run(['/bin/systemctl', 'restart', 'unbound'], timeout=40).returncode == 0
+        result = run(['/bin/systemctl', 'start', 'adguardhome'], timeout=120)
+        if result.returncode:
+            return fail('adguard_start_failed', 'AdGuard Home could not start; plain recursive mode stays active.')
+        return ok('set_dns_stack', 'AdGuard filtering DNS active'
+                  + (' (Unbound fallback on 5335).' if unbound_up
+                     else ' (Unbound fallback did not restart, so there is no resolver fallback).')
+                  + ('' if persisted else ' Saving the mode for next boot failed.'))
+    if not ns_list:
+        return fail('no_upstream', 'No hotel nameserver is available for plain recursive mode.')
+    conf = ('# Generated by the TravelPi helper: plain recursive mode (Unbound on :53, AdGuard off).\n'
+            'server:\n  port: 53\n  interface: 0.0.0.0\n'
+            '  access-control: 127.0.0.1 allow\n  access-control: 192.168.200.0/24 allow\n'
+            'forward-zone:\n  name: "."\n'
+            + ''.join('  forward-addr: ' + ns + '\n' for ns in ns_list))
+    try:
+        Path(UNBOUND_FRONT_CONF).write_text(conf)
+    except OSError:
+        return fail('unbound_conf_unwritable', 'Unbound drop-in could not be written.')
+    check = run(['/usr/sbin/unbound-checkconf'], timeout=20)
+    if check.returncode:
+        try:
+            Path(UNBOUND_FRONT_CONF).unlink(missing_ok=True)
+        except OSError:
+            pass
+        return fail('unbound_conf_invalid', 'Recursive-mode config failed validation; nothing changed.')
+    run(['/bin/systemctl', 'stop', 'adguardhome'], timeout=90)
+    restart = run(['/bin/systemctl', 'restart', 'unbound'], timeout=40)
+    if restart.returncode:
+        try:
+            Path(UNBOUND_FRONT_CONF).unlink(missing_ok=True)
+        except OSError:
+            pass
+        run(['/bin/systemctl', 'restart', 'unbound'], timeout=40)
+        run(['/bin/systemctl', 'start', 'adguardhome'], timeout=120)
+        return fail('unbound_start_failed', 'Unbound could not take over :53; the filtered stack was restored.')
+    persisted = write_mode('unbound')
+    return ok('set_dns_stack', 'Plain recursive DNS active (Unbound on :53, AdGuard stopped).'
+              + ('' if persisted else ' Saving the mode for next boot failed.'))
+
+
+AP_NETWORK_FILE = '/etc/systemd/network/070-travelpi-ap.network'
+AP_RA_OFF_DROPIN = '/etc/systemd/network/070-travelpi-ap.network.d/ra-off.conf'
+
+
+def set_ipv6(request):
+    """Router advertisements are owned by systemd-networkd (ADR 0006), not
+    radvd. On/off is a drop-in that sets IPv6SendRA=no; networkctl
+    reconfigure applies it without flushing the AP addresses (Address= in the
+    .network file keeps them networkd-owned)."""
+    mode = str(request.get('mode') or '')
+    if mode not in ('on', 'off'):
+        return fail('invalid_mode', 'IPv6 mode must be on or off')
+    if not Path(AP_NETWORK_FILE).exists():
+        return fail('unavailable', 'The networkd AP profile is not installed on this host; router advertisements cannot be changed.')
+    if mode == 'on' and ula_prefix() is None:
+        return fail('unavailable', 'No ULA prefix is configured in ' + ULA_PREFIX_FILE + '; run travelpi-ula-init (make deploy does) before advertising IPv6.')
+    dropin = Path(AP_RA_OFF_DROPIN)
+    previous = dropin.read_text() if dropin.exists() else None
+    try:
+        if mode == 'off':
+            dropin.parent.mkdir(parents=True, exist_ok=True)
+            dropin.write_text('[Network]\nIPv6SendRA=no\n')
+        else:
+            dropin.unlink(missing_ok=True)
+    except OSError:
+        return fail('ra_change_failed', 'Router advertisement setting could not be written; nothing changed.')
+
+    def restore():
+        try:
+            if previous is None:
+                dropin.unlink(missing_ok=True)
+            else:
+                dropin.write_text(previous)
+        except OSError:
+            pass
+        run(['/usr/bin/networkctl', 'reload'], timeout=30)
+        run(['/usr/bin/networkctl', 'reconfigure', LAN], timeout=30)
+
+    reload_result = run(['/usr/bin/networkctl', 'reload'], timeout=30)
+    result = run(['/usr/bin/networkctl', 'reconfigure', LAN], timeout=30) if reload_result.returncode == 0 else reload_result
+    if result.returncode:
+        restore()
+        return fail('ra_change_failed', 'systemd-networkd could not apply the change; the previous setting was restored.')
+    return ok('set_ipv6', 'Router advertisements on; LAN devices get ULA (private IPv6) addresses.'
+              if mode == 'on' else 'Router advertisements stopped; IPv6 off for LAN devices.')
+
+
+def set_sqm_mode(request):
+    mode = str(request.get('mode') or '')
+    if mode not in ('auto', 'manual', 'off'):
+        return fail('invalid_mode', 'SQM mode must be auto, manual, or off')
+
+    def set_env(value):
+        try:
+            lines = Path(SQM_ENV_FILE).read_text(errors='replace').splitlines()
+        except OSError:
+            lines = []
+        out, replaced = [], False
+        for line in lines:
+            if line.startswith('TRAVELPI_SQM_AUTOTUNE='):
+                out.append('TRAVELPI_SQM_AUTOTUNE=' + value)
+                replaced = True
+            else:
+                out.append(line)
+        if not replaced:
+            out.append('TRAVELPI_SQM_AUTOTUNE=' + value)
+        try:
+            write_private_file(SQM_ENV_FILE, '\n'.join(out) + '\n', 0o644)
+            return True
+        except OSError:
+            return False
+
+    if mode == 'off':
+        stopped = run(['/bin/systemctl', 'stop', SQM_SERVICE], timeout=30).returncode == 0
+        run(['/bin/systemctl', 'stop', 'travelpi-sqm-tune.timer'], timeout=20)
+        persisted = set_env('no')
+        cake_state = ((status()['status'].get('cake') or {}).get('state'))
+        cake_gone = cake_state != 'active'
+        return ok('set_sqm_mode', ('Traffic shaping off; the CAKE qdisc is removed.'
+                  if stopped and cake_gone
+                  else 'Traffic shaping stop was requested; the CAKE qdisc is still reported active.')
+                  + ('' if persisted else ' Saving the mode for next boot failed.'))
+    persisted = set_env('yes' if mode == 'auto' else 'no')
+    result = run(['/bin/systemctl', 'restart', SQM_SERVICE], timeout=45)
+    if result.returncode:
+        return fail('sqm_restart_failed', 'SQM service could not restart.')
+    if mode == 'auto':
+        run(['/bin/systemctl', 'restart', 'travelpi-sqm-tune.timer'], timeout=20)
+    else:
+        run(['/bin/systemctl', 'stop', 'travelpi-sqm-tune.timer'], timeout=20)
+    tail = '' if persisted else ' Saving the mode for next boot failed.'
+    return ok('set_sqm_mode', ('Traffic shaping auto-tunes from probes.'
+              if mode == 'auto' else 'Traffic shaping pinned to the dashboard rate.') + tail)
+
+
+def set_cpu_governor(request):
+    governor = str(request.get('governor') or '')
+    if governor not in CPU_GOVERNORS:
+        return fail('invalid_governor', 'Governor must be conservative, ondemand, or performance')
+    persisted = True
+    try:
+        write_private_file(POWER_PROFILE_ENV, 'GOVERNOR=' + governor + '\n', 0o644)
+    except OSError:
+        persisted = False
+    applied = run(['/bin/sh', '-c',
+                   'for d in /sys/devices/system/cpu/cpu*/cpufreq; do echo ' + governor +
+                   ' > "$d/scaling_governor"; done'])
+    if applied.returncode:
+        return fail('governor_failed', 'CPU governor could not be applied live.')
+    if not persisted:
+        return ok('set_cpu_governor',
+                  'CPU governor set to ' + governor + ' for this boot; saving it for next boot failed.')
+    return ok('set_cpu_governor', 'CPU governor set to ' + governor + ' and saved for next boot.')
+
+
+def reclaim_memory(request):
+    """Manual counterpart of the memory guard's first aid: sync and drop
+    kernel page caches. It never stops services and never kills processes;
+    swap only frees as processes exit."""
+    def avail():
+        try:
+            for line in Path('/proc/meminfo').read_text().splitlines():
+                if line.startswith('MemAvailable:'):
+                    return int(line.split()[1]) // 1024
+        except (OSError, ValueError, IndexError):
+            return None
+        return None
+    before = avail()
+    run(['/bin/sync'], timeout=20)
+    drop = run(['/bin/sh', '-c', 'echo 3 > /proc/sys/vm/drop_caches'], timeout=60)
+    if drop.returncode:
+        return fail('reclaim_failed', 'Kernel cache drop was refused.')
+    after = avail()
+    freed = after - before if (before is not None and after is not None) else None
+    note = 'Page caches dropped' + (': ' + str(max(0, freed)) + ' MB newly available.'
+                                    if freed is not None else '.')
+    return ok('reclaim_memory', note)
+
+
+def action(name, request):
+    try:
+        return _action(name, request)
+    except Exception as exc:
+        # Never leak a traceback or secrets from request fields: log only the
+        # exception class and action name.
+        sys.stderr.write('travelpi-cockpit: %s failed: %s\n' % (name, type(exc).__name__))
+        return fail('internal_error', 'The helper hit an unexpected error; check status before retrying.')
+
+
+def _action(name, request):
+    if name not in ACTION_FIELDS or request.get('action') != name:
+        return fail('unknown_action', 'Action is not allowed')
+    extra = set(request) - ACTION_FIELDS[name]
+    if extra:
+        return fail('unknown_fields', 'Unknown request fields are not allowed')
+    if not confirm(request):
+        return fail('confirmation_required', 'Explicit confirmation is required')
+    if name == 'vpn_toggle':
+        return vpn_toggle(request)
+    if name == 'tailscale_auth':
+        return tailscale_auth(request)
+    if name == 'connect_hotel':
+        return connect_hotel(request)
+    if name == 'apply_mac_clone':
+        return clone_mac(request)
+    if name == 'set_ap_radio':
+        return ap_profile(request)
+    if name == 'set_ap_identity':
+        return set_ap_identity(request)
+    if name == 'set_wan_band':
+        return set_wan_band(request)
+    if name == 'wan_flip':
+        return wan_flip(request)
+    if name == 'reset_radios':
+        return reset_radios(request)
+    if name == 'set_cake_rate':
+        return cake_rate(request)
+    if name == 'restart_services':
+        return restart_services(request)
+    if name == 'set_dns_stack':
+        return set_dns_stack(request)
+    if name == 'set_ipv6':
+        return set_ipv6(request)
+    if name == 'set_sqm_mode':
+        return set_sqm_mode(request)
+    if name == 'set_cpu_governor':
+        return set_cpu_governor(request)
+    if name == 'reclaim_memory':
+        return reclaim_memory(request)
+    if name == 'wake_peer':
+        return wake_peer(request)
+    if name == 'reboot':
+        result = run(['/bin/systemctl', 'reboot'])
+        return ok(name, 'Reboot requested') if result.returncode == 0 else fail('reboot_failed', 'Reboot request failed')
+    return fail('unknown_action', 'Action is not allowed')
+
+
+def status_cached():
+    """Cache the status payload briefly so repeat page loads render instantly.
+
+    Mutations and action responses always compute fresh status(); only the
+    read-only status command consults the cache. Uses monotonic time so an
+    unsynced clock (no RTC) cannot poison freshness."""
+    cached = fresh_cache(STATUS_CACHE, ('response',), STATUS_CACHE_TTL)
+    response = cached.get('response') if cached else None
+    if isinstance(response, dict) and response.get('ok'):
+        return response
+    try:
+        response = status()
+    except Exception:
+        response = fail('status_probe_failed', 'Status probe failed on the host; try again')
+    store_cache(STATUS_CACHE, response=response)
+    return response
+
+
+# --- DHCPv6 prefix-delegation probe (read-only) -------------------------------
+# One SOLICIT with an IA_PD option; the answer is only parsed, never REQUESTed,
+# so no lease is taken. Packet build/parse are pure; socket I/O is the seam
+# pd_udp_exchange (tests replace PD_TRANSPORT) and pd_euid (PD_EUID).
+DHCPV6_SERVERS = 'ff02::1:2'
+DHCPV6_SERVER_PORT = 547
+DHCPV6_CLIENT_PORT = 546
+PD_ATTEMPTS = 3
+PD_ATTEMPT_TIMEOUT = 3.0
+PD_TOTAL_BUDGET = 12.0
+PD_IF_INET6 = Path('/proc/net/if_inet6')
+DHCPV6_STATUS_NAMES = {1: 'UnspecFail', 2: 'NoAddrsAvail', 3: 'NoBinding', 4: 'NotOnLink',
+                       5: 'UseMulticast', 6: 'NoPrefixAvail'}
+
+
+def build_pd_solicit(mac, xid):
+    """SOLICIT with DUID-LL client id, elapsed time and one IA_PD (iaid 1, t1=t2=0)."""
+    if len(mac) != 6 or len(xid) != 3:
+        raise ValueError('mac must be 6 bytes and xid 3 bytes')
+    duid = (3).to_bytes(2, 'big') + (1).to_bytes(2, 'big') + bytes(mac)
+    ia_pd = (1).to_bytes(4, 'big') + (0).to_bytes(4, 'big') + (0).to_bytes(4, 'big')
+    packet = bytes([1]) + bytes(xid)
+    for code, body in ((1, duid), (8, b'\x00\x00'), (25, ia_pd)):
+        packet += code.to_bytes(2, 'big') + len(body).to_bytes(2, 'big') + body
+    return packet
+
+
+def _dhcpv6_options(data):
+    """Yield (code, body) options; raise ValueError when the framing is malformed."""
+    index = 0
+    while index < len(data):
+        if index + 4 > len(data):
+            raise ValueError('truncated option header')
+        code = int.from_bytes(data[index:index + 2], 'big')
+        length = int.from_bytes(data[index + 2:index + 4], 'big')
+        body = data[index + 4:index + 4 + length]
+        if len(body) != length:
+            raise ValueError('truncated option body')
+        yield code, body
+        index += 4 + length
+
+
+def parse_pd_reply(data, xid):
+    """Parse an ADVERTISE/REPLY for our transaction id.
+
+    Returns None for anything that is not a well-formed answer to us (wrong
+    message type, wrong xid, truncated). Otherwise a dict with msg_type,
+    status (int or None), prefix, prefix_len, valid_s.
+    """
+    if not isinstance(data, (bytes, bytearray)) or len(data) < 4:
+        return None
+    if data[0] not in (2, 7) or bytes(data[1:4]) != bytes(xid):
+        return None
+    result = {'msg_type': data[0], 'status': None, 'prefix': None, 'prefix_len': None, 'valid_s': None}
+    try:
+        for code, body in _dhcpv6_options(bytes(data[4:])):
+            if code == 13 and len(body) >= 2:
+                result['status'] = int.from_bytes(body[:2], 'big')
+            elif code == 25:
+                if len(body) < 12:
+                    return None
+                for sub, subbody in _dhcpv6_options(body[12:]):
+                    if sub == 13 and len(subbody) >= 2:
+                        result['status'] = int.from_bytes(subbody[:2], 'big')
+                    elif sub == 26:
+                        if len(subbody) < 25:
+                            return None
+                        plen = subbody[8]
+                        if plen > 128:
+                            return None
+                        result['valid_s'] = int.from_bytes(subbody[4:8], 'big')
+                        result['prefix_len'] = plen
+                        result['prefix'] = str(ipaddress.IPv6Address(bytes(subbody[9:25])))
+    except ValueError:
+        return None
+    return result
+
+
+def match_dhcpv6_datagram(datagram):
+    """Strip the UDP header from a raw IPPROTO_UDP read; None unless sport 547 / dport 546."""
+    if len(datagram) < 8:
+        return None
+    sport = int.from_bytes(datagram[0:2], 'big')
+    dport = int.from_bytes(datagram[2:4], 'big')
+    if sport != DHCPV6_SERVER_PORT or dport != DHCPV6_CLIENT_PORT:
+        return None
+    return bytes(datagram[8:])
+
+
+def pd_euid():
+    return os.geteuid()
+
+
+# Privilege seam for the CLI gates: tests replace it to exercise the refusal
+# path whether or not the suite itself runs as root.
+EUID = pd_euid
+
+
+def pd_open_sockets(interface):
+    """Open the raw listener and the multicast sender bound to `interface`.
+
+    Returns (raw, sender, destination). Closes whatever was opened if a later
+    step fails. Raises OSError on failure."""
+    import socket
+    index = socket.if_nametoindex(interface)
+    bind_to_device = getattr(socket, 'SO_BINDTODEVICE', 25)
+    raw = socket.socket(socket.AF_INET6, socket.SOCK_RAW, socket.IPPROTO_UDP)
+    sender = None
+    try:
+        sender = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+        raw.setsockopt(socket.SOL_SOCKET, bind_to_device, interface.encode())
+        sender.setsockopt(socket.SOL_SOCKET, bind_to_device, interface.encode())
+        sender.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_MULTICAST_HOPS, 1)
+    except BaseException:
+        raw.close()
+        if sender is not None:
+            sender.close()
+        raise
+    return raw, sender, (DHCPV6_SERVERS, DHCPV6_SERVER_PORT, 0, index)
+
+
+# Socket-opening seam: tests substitute loopback sockets for the raw/multicast pair.
+PD_SOCKETS = pd_open_sockets
+
+
+def pd_udp_exchange(interface, packet, xid, timeout):
+    """Socket seam: send one SOLICIT, return (payload, source) for a matching answer or None.
+
+    Sends from an ephemeral UDP socket and listens on a raw UDP socket, so it
+    never competes with NetworkManager for UDP 546. Raises OSError on failure.
+    """
+    import select
+    raw, sender, destination = PD_SOCKETS(interface)
+    try:
+        sender.sendto(packet, destination)
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            ready, _, _ = select.select([raw], [], [], remaining)
+            if not ready:
+                return None
+            datagram, source = raw.recvfrom(2048)
+            payload = match_dhcpv6_datagram(datagram)
+            if payload is not None and len(payload) >= 4 and payload[1:4] == bytes(xid):
+                return payload, source[0].split('%')[0]
+    finally:
+        raw.close()
+        sender.close()
+
+
+PD_TRANSPORT = pd_udp_exchange
+PD_EUID = pd_euid
+
+
+def _pd_result(state, detail, **extra):
+    pd = {'state': state, 'prefix': None, 'prefix_len': None, 'valid_s': None, 'server': None, 'detail': detail}
+    pd.update(extra)
+    return {'ok': True, 'action': 'pd_probe', 'pd': pd}
+
+
+def _pd_has_link_local(interface):
+    try:
+        for line in PD_IF_INET6.read_text().splitlines():
+            fields = line.split()
+            if len(fields) >= 6 and fields[5] == interface and fields[0].startswith('fe80'):
+                return True
+    except OSError:
+        pass
+    return False
+
+
+def dhcpv6_pd_probe(interface=WAN):
+    if PD_EUID() != 0:
+        return _pd_result('unavailable', 'Administrative access is required to check prefix delegation.')
+    try:
+        mac_text = (DEVICE_SYS / interface / 'address').read_text().strip()
+        state = (DEVICE_SYS / interface / 'operstate').read_text().strip()
+    except OSError:
+        return _pd_result('unavailable', interface + ' is not present, so prefix delegation cannot be checked.')
+    if state != 'up':
+        return _pd_result('unavailable', interface + ' is not connected, so prefix delegation cannot be checked.')
+    if not MAC_RE.match(mac_text):
+        return _pd_result('unavailable', interface + ' has no usable hardware address.')
+    if not _pd_has_link_local(interface):
+        return _pd_result('unavailable', interface + ' has no IPv6 link-local address yet.')
+    mac = bytes(int(part, 16) for part in mac_text.split(':'))
+    xid = os.urandom(3)
+    packet = build_pd_solicit(mac, xid)
+    started = time.monotonic()
+    answered = None
+    for _ in range(PD_ATTEMPTS):
+        budget = PD_TOTAL_BUDGET - (time.monotonic() - started)
+        if budget <= 0:
+            break
+        try:
+            answered = PD_TRANSPORT(interface, packet, xid, min(PD_ATTEMPT_TIMEOUT, budget))
+        except OSError as error:
+            return _pd_result('unavailable', 'Could not send the DHCPv6 request on ' + interface + ': ' + (error.strerror or 'socket error') + '.')
+        if answered:
+            break
+    if not answered:
+        return _pd_result('not_offered', 'No DHCPv6 server answered on this network (no prefix delegation offered).')
+    reply = parse_pd_reply(answered[0], xid)
+    server = answered[1]
+    if reply is None:
+        return _pd_result('not_offered', 'A DHCPv6 server answered but the reply was not understood; treating prefix delegation as not offered.', server=server)
+    if reply['prefix'] is not None and reply['status'] in (None, 0):
+        return _pd_result('offered', 'The network offers prefix delegation: ' + reply['prefix'] + '/' + str(reply['prefix_len']) + '.',
+                          prefix=reply['prefix'], prefix_len=reply['prefix_len'], valid_s=reply['valid_s'], server=server)
+    if reply['status'] == 6:
+        return _pd_result('not_offered', 'The DHCPv6 server answered NoPrefixAvail: it has no prefix to delegate.', server=server)
+    if reply['status']:
+        name = DHCPV6_STATUS_NAMES.get(reply['status'], 'status ' + str(reply['status']))
+        return _pd_result('not_offered', 'The DHCPv6 server answered ' + name + ' instead of a prefix.', server=server)
+    return _pd_result('not_offered', 'A DHCPv6 server answered without offering a prefix.', server=server)
+
+
+def main():
+    command = sys.argv[1] if len(sys.argv) >= 2 else ''
+    if command == 'status':
+        response = status_cached()
+    elif command == 'probe':
+        target = None
+        if len(sys.argv) > 2:
+            target = validate_probe_target(sys.argv[2])
+            if target is None:
+                response = fail('invalid_probe_target', 'Probe target must be a bare hostname')
+                print(json.dumps(response, separators=(',', ':')))
+                return 1
+        response = probe(target or 'google.com')
+    elif command == 'scan':
+        if EUID() != 0:
+            response = fail('not_privileged', 'Administrative access is required for this scan')
+        else:
+            response = wifi_scan()
+    elif command == 'pd':
+        if EUID() != 0:
+            response = fail('not_privileged', 'Administrative access is required for this check')
+        else:
+            response = dhcpv6_pd_probe(WAN)
+    elif command == 'readiness':
+        response = readiness_status()
+    elif command == 'portal':
+        # Fresh portal probe for the dashboard's re-check button (cache
+        # bypass with 'fresh'); display-only, never automates portal login.
+        response = ok('portal', 'Portal probe completed.')
+        response['portal'] = portal_status(force=len(sys.argv) > 2 and sys.argv[2] == 'fresh')
+    elif command == 'action':
+        if EUID() != 0:
+            print(json.dumps(fail('not_privileged', 'Administrative access is required for this action')))
+            return 1
+        request = json_lines(sys.stdin.read(65536))
+        if not isinstance(request, dict):
+            response = fail('invalid_request', 'Expected one JSON object')
+        else:
+            response = action(request.get('action'), request)
+    else:
+        response = fail('invalid_command', 'Command is not allowed')
+    print(json.dumps(response, separators=(',', ':')))
+    return 0 if response.get('ok') else 1
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
