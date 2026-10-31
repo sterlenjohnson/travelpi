@@ -34,6 +34,6 @@ This is a volunteer-maintained project. We aim to acknowledge a report within ab
 - No captive-portal login automation, and no capability is claimed that the host has not demonstrated.
 - The Cockpit package directory is root-owned and not writable by the web user; the package is plain static files under a same-origin CSP, with no remote assets.
 - Config backups can contain Wi-Fi secrets and the Tailscale node key; they are root-only on the Pi and `make backup-pull` saves them with mode 0600. Treat them as sensitive.
-- `make deploy` installs a sudoers rule that lets the deploy user read the AdGuard config as root, pinned to that one path. See the README sections "What make deploy changes on the host" and "Controls and assumptions".
+- `make deploy` installs a sudoers rule that lets the deploy user read the AdGuard config as root, pinned to that one path. See the reference sections "What make deploy changes on the host" and "Controls and assumptions".
 
-See also the threat model in the README.
+See also the threat model in [docs/REFERENCE.md](docs/REFERENCE.md).

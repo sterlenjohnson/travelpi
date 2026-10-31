@@ -100,7 +100,7 @@ the code after a large refactor; they are anchors, not instructions.
 ## Network roles
 
 - `wlan0` is the hotel WAN (STA); `wlan1` is the LAN AP. Source of truth:
-  `helper/travelpi-cockpit` and the README.
+  `helper/travelpi-cockpit` and `docs/REFERENCE.md`.
 - AdGuard Home runs as a rootless Quadlet unit at
   `systemd/user/adguardhome.container` with a 192 MiB memory ceiling and host
   networking.

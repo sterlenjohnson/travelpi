@@ -44,7 +44,7 @@ The root-run scripts under `systemd/` accept environment overrides for the comma
 
 ## Deploying touches a real host
 
-`make deploy` installs units, sysctl, modprobe and NetworkManager files, restarts services and may interrupt the Pi's own network. Read the README section "What make deploy changes on the host" and the `deploy` target first. You do not need to deploy to contribute, and please do not claim hardware behavior you have not observed.
+`make deploy` installs units, sysctl, modprobe and NetworkManager files, restarts services and may interrupt the Pi's own network. Read the section "What make deploy changes on the host" in `docs/REFERENCE.md` and the `deploy` target first. You do not need to deploy to contribute, and please do not claim hardware behavior you have not observed.
 
 ## Issue tracking in this repo
 

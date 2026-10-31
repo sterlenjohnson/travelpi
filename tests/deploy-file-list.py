@@ -61,7 +61,7 @@ check(not missing, f"deploy installs files that are not in the repo: {missing}")
 
 # Every file under systemd/ must be installed by deploy, or named in the README
 # as host-side configuration the administrator owns.
-readme = (ROOT / "README.md").read_text(encoding="utf-8")
+readme = (ROOT / "README.md").read_text(encoding="utf-8") + (ROOT / "docs" / "REFERENCE.md").read_text(encoding="utf-8")
 installed = set(sources)
 orphans = []
 for path in sorted((ROOT / "systemd").rglob("*")):

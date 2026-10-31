@@ -192,9 +192,9 @@ for t in (SYSTEMD).glob("*.timer"):
 # ADR and README mention.
 adr = ROOT / "docs/adr/0008-service-hardening.md"
 check(adr.exists() and "Accepted" in adr.read_text(encoding="utf-8"), "ADR 0008 must exist and be Accepted")
-check("0008" in (ROOT / "README.md").read_text(encoding="utf-8") or
-      "service hardening" in (ROOT / "README.md").read_text(encoding="utf-8").lower(),
-      "README must mention service hardening")
+check("0008" in (ROOT / "docs" / "REFERENCE.md").read_text(encoding="utf-8") or
+      "service hardening" in (ROOT / "docs" / "REFERENCE.md").read_text(encoding="utf-8").lower(),
+      "the reference must mention service hardening")
 
 if failures:
     print("unit-hardening FAILED:")

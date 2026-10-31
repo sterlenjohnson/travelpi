@@ -6,7 +6,7 @@
 #   make harness-check  mount and validate the agent harness (harness/, AGENTS.md).
 #   make check          the full gate: harness-check, then test.
 #   make package|deploy build the archive / install on a Pi (deploy changes a real
-#                       host; read README "What make deploy changes" first).
+#                       host; read docs/REFERENCE.md "What make deploy changes" first).
 
 PI_HOST ?= travelpi.local
 PI_USER ?= pi
