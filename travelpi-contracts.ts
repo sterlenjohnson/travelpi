@@ -21,6 +21,8 @@ export const mutationActions = [
     "reclaim_memory",
 ] as const;
 
+export type RestartTarget = "ap" | "sqm";
+
 export type RadioBand = "2.4ghz" | "5ghz" | "6ghz";
 
 export type MutationAction = (typeof mutationActions)[number];
@@ -28,16 +30,16 @@ export type AvailableMutationAction = Exclude<MutationAction, "wan_flip">;
 
 export interface MutationPayloadMap {
     connect_hotel: { ssid: string; password?: string; hidden?: boolean };
-    apply_mac_clone: { mac?: string; mode?: "random" | "default" };
+    apply_mac_clone: { mac?: string; mode?: "specific" | "random" | "default" };
     set_ap_radio: { band: RadioBand; channel?: number };
     set_wan_band: { band: "auto" | RadioBand };
     set_ap_identity: { ssid?: string; passphrase?: string };
     set_cake_rate: { rate_kbit: number };
-    restart_services: { targets: string[] };
+    restart_services: { targets: RestartTarget[] };
     vpn_toggle: { provider: "tailscale" | "wireguard"; enabled: boolean };
-    tailscale_auth: { authkey?: string };
+    tailscale_auth: { authkey: string };
     reboot: Record<string, never>;
-    wan_flip: Record<string, never>;
+    wan_flip: { wan?: string };
     reset_radios: Record<string, never>;
     wake_peer: { target: string };
     set_dns_stack: { service: "adguard" | "unbound"; upstream?: string };
@@ -100,6 +102,8 @@ export interface ReadinessStatus {
     transient_networkmanager: { available: boolean; reason: string };
     role_switch: { available: boolean; reason: string };
     ap_profiles: { tested: string[]; all_bands: boolean };
+    firmware: { state: "ok" | "elevated" | "unknown"; overrides: string[] | null };
+    memory_guards: { guarded_units: string[]; unprotected_units: string[] };
 }
 
 export interface VpnProviderStatus {

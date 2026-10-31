@@ -1243,9 +1243,12 @@ type PdProbe = import("./travelpi-contracts").PdProbe;
             return;
         }
         if (!spec) {
-            showNotice(TravelPiTyped.displayValue(
-                TravelPiTyped.firstValue(lastReadiness, ["role_switch.reason"], null),
-                "That action is unavailable on this host."), true);
+            // Only the role swap is gated by readiness evidence; other actions get the generic notice.
+            showNotice(command === "wan_flip"
+                ? TravelPiTyped.displayValue(
+                    TravelPiTyped.firstValue(lastReadiness, ["role_switch.reason"], null),
+                    "That action is unavailable on this host.")
+                : "That action is unavailable on this host.", true);
             return;
         }
 

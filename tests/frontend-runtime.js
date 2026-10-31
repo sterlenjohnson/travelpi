@@ -685,6 +685,24 @@ assert.ok(elements["quick-ipv6-mode-note"].textContent.includes("IPv4 only"));
     assert.deepStrictEqual(JSON.parse(JSON.stringify(staged[1])), ["connect_hotel", { ssid: "HotelWiFi", password: "x" }]);
 }
 
+// Unavailable-action notice: only the role swap borrows the readiness reason.
+{
+    const shown = [];
+    const sandbox = {
+        byId: () => null, showNotice: (message) => shown.push(message),
+        mutationState: { busy: false, confirmation: null },
+        lastReadiness: { role_switch: { available: false, reason: "Requires wired-uplink evidence" } },
+        TravelPiTyped: context.TravelPiTyped,
+        MUTATIONS: { describe: () => null },
+    };
+    vm.createContext(sandbox);
+    vm.runInContext(extractFunction("requestConfirmation", source), sandbox);
+    sandbox.requestConfirmation("wan_flip", { wan: "wlan1" });
+    sandbox.requestConfirmation("reclaim_memory");
+    assert.strictEqual(shown[0], "Requires wired-uplink evidence");
+    assert.strictEqual(shown[1], "That action is unavailable on this host.");
+}
+
 console.log("frontend runtime checks passed");
 
 // In-progress notice: a started action must never leave the page looking inert.
