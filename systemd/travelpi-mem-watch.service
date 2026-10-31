@@ -1,6 +1,9 @@
 [Unit]
 Description=TravelPi memory/swap guard (act before the OOM freeze)
 After=network.target
+# hardening: stop a crash loop after 5 starts in 5 minutes instead of spinning.
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -9,6 +12,16 @@ Restart=always
 RestartSec=10
 KillMode=process
 Nice=5
-
-[Install]
-WantedBy=multi-user.target
+# hardening: the loop writes only /var/lib/travelpi and /run; it never writes
+# under /etc, /usr or /boot. ProtectSystem=full keeps them read-only.
+ProtectSystem=full
+ProtectHome=yes
+# hardening: ps/awk/systemctl use no /tmp; state is in /run and /var/lib.
+PrivateTmp=yes
+NoNewPrivileges=yes
+RestrictRealtime=yes
+LockPersonality=yes
+# hardening: peaks ~15 MB live. Deliberately NOT set: ProtectProc/PrivateUsers/
+# CapabilityBoundingSet (it needs CAP_KILL and a view of every process), and
+# RestrictAddressFamilies (systemctl uses AF_UNIX to the manager).
+MemoryMax=64M

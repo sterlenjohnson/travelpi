@@ -8,6 +8,20 @@ Type=oneshot
 RemainAfterExit=yes
 Environment=TRAVELPI_RADIO_BOOT=1 TRAVELPI_RADIO_WAIT=20
 ExecStart=/usr/local/libexec/travelpi-radio-driver
+# hardening: this unit is ordered Before=hostapd, so a hang would hold up the AP
+# at boot. Worst case: 20 s enumeration wait, 30 s bind poll, plus modprobe.
+TimeoutStartSec=180
+# hardening: NOT set because the script needs them: ProtectSystem (it removes
+# /etc/modprobe.d/travelpi-mt7925.conf), ProtectKernelModules (modprobe/-r),
+# ProtectKernelTunables and PrivateDevices (writes /sys/bus/usb/drivers/*/bind),
+# PrivateNetwork/RestrictAddressFamilies (systemctl uses AF_UNIX).
+ProtectHome=yes
+# hardening: no /tmp use.
+PrivateTmp=yes
+NoNewPrivileges=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryMax=64M
 
 [Install]
 WantedBy=multi-user.target

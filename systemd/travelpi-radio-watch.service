@@ -1,6 +1,9 @@
 [Unit]
 Description=TravelPi radio auto-recovery watchdog for the AP radio
 After=NetworkManager.service hostapd.service wlan1-static-ip.service
+# hardening: stop a crash loop after 5 starts in 5 minutes instead of spinning.
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -11,6 +14,16 @@ RuntimeDirectoryPreserve=yes
 Restart=always
 RestartSec=5
 Nice=10
-
-[Install]
-WantedBy=multi-user.target
+# hardening: writes only /var/lib/travelpi, /run/travelpi-radio-watch and /sys
+# (USB unbind/bind; /sys stays writable, so ProtectKernelTunables is NOT set).
+# Nothing under /etc, /usr or /boot, so those can be read-only.
+ProtectSystem=full
+ProtectHome=yes
+# hardening: state lives in /run and /var/lib, not /tmp.
+PrivateTmp=yes
+NoNewPrivileges=yes
+RestrictRealtime=yes
+LockPersonality=yes
+# hardening: peaks ~15 MB live. Not restricted: address families (ip uses
+# AF_NETLINK, systemctl AF_UNIX), PrivateDevices (USB unbind needs /sys).
+MemoryMax=64M

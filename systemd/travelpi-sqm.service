@@ -9,6 +9,22 @@ EnvironmentFile=-/etc/default/travelpi-sqm
 ExecStart=/usr/local/sbin/travelpi-sqm start
 ExecStop=/usr/local/sbin/travelpi-sqm stop
 RemainAfterExit=yes
+# hardening: ip/tc/modprobe calls are quick; bound them so a wedged qdisc call
+# cannot stall boot or shutdown.
+TimeoutStartSec=60
+TimeoutStopSec=60
+# hardening: the script writes nothing to disk (netlink/qdisc state only), so
+# /usr, /boot and /etc can be read-only.
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+RestrictRealtime=yes
+LockPersonality=yes
+# hardening: NOT set: ProtectKernelModules (modprobe sch_cake/ifb),
+# RestrictAddressFamilies and PrivateNetwork (tc and ip need AF_NETLINK on the
+# real namespace), PrivateDevices.
+MemoryMax=64M
 
 [Install]
 WantedBy=multi-user.target

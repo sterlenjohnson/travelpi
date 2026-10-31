@@ -6,3 +6,17 @@ After=network-online.target
 Type=oneshot
 ExecStart=/usr/local/sbin/travelpi-sqm-autotune
 Nice=10
+# hardening: two curl probes of at most 25 s each plus a systemctl restart; a
+# stalled hotel link must not leave the tuner running forever.
+TimeoutStartSec=180
+# hardening: ProtectSystem is NOT set: the tuner rewrites /etc/default/travelpi-sqm.
+ProtectHome=yes
+# hardening: the upload payload is created with mktemp under /run, not /tmp.
+PrivateTmp=yes
+NoNewPrivileges=yes
+RestrictRealtime=yes
+LockPersonality=yes
+# hardening: curl, a 10 MB dd payload on tmpfs and awk; well below 64 MB. Not
+# restricted: address families or PrivateNetwork (curl --interface wlan0 needs
+# the real network namespace and SO_BINDTODEVICE).
+MemoryMax=64M

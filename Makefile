@@ -68,6 +68,7 @@ test:
 	python3 tests/manifest-pages.py
 	python3 tests/deploy-file-list.py
 	python3 tests/package-list.py
+	python3 tests/unit-hardening.py
 	python3 tests/dispatcher-iface.py
 	python3 tests/action-contract-alignment.py
 	python3 tests/dom-write-coverage.py

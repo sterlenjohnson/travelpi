@@ -8,6 +8,20 @@ Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/local/libexec/travelpi-power-record start
 ExecStop=/usr/local/libexec/travelpi-power-record stop
+# hardening: vcgencmd talks to the firmware mailbox and can stall; bound start and stop.
+TimeoutStartSec=30
+TimeoutStopSec=30
+# hardening: writes only /var/lib/travelpi (state.json, power-log.jsonl); reads
+# /proc. Nothing under /etc, /usr or /boot.
+ProtectSystem=full
+ProtectHome=yes
+# hardening: no /tmp use (state is in /var/lib/travelpi).
+PrivateTmp=yes
+NoNewPrivileges=yes
+RestrictRealtime=yes
+LockPersonality=yes
+# hardening: PrivateDevices is deliberately NOT set: vcgencmd opens /dev/vcio.
+MemoryMax=64M
 
 [Install]
 WantedBy=multi-user.target

@@ -8,6 +8,30 @@ Type=oneshot
 ExecStart=/bin/sh -c 'd=$(curl -fsSI -m 10 https://www.google.com/generate_204 2>/dev/null | grep -i "^date:" | sed "s/^[Dd]ate: *//"); if [ -n "$d" ]; then date -u -s "$d" && echo "clock set from HTTPS: $d"; else echo "no HTTPS date header reachable"; fi'
 SuccessExitStatus=0 1
 TimeoutStartSec=30
+# hardening: this unit parses an untrusted network header and runs `date -u -s`
+# as root, so it gets the strongest profile. It reads no state and writes no file.
+# hardening: the only privilege needed is setting the clock (settimeofday).
+CapabilityBoundingSet=CAP_SYS_TIME
+# hardening: curl needs IP sockets; AF_UNIX stays for libc/NSS name-service
+# sockets (nscd, nss modules). No netlink, no packet sockets.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# hardening: nothing is written to disk (output goes to the journal).
+ProtectSystem=strict
+# hardening: curl and date need only /dev/null and /dev/urandom, which a private /dev provides.
+PrivateDevices=yes
+# hardening: no module loading, no cgroup writes.
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+# hardening: ProtectClock is deliberately NOT set: it would block `date -u -s`.
+# hardening: no setuid escalation, no home access, no realtime, fixed personality;
+# no file is exchanged through /tmp so the private /tmp is safe.
+NoNewPrivileges=yes
+ProtectHome=yes
+RestrictRealtime=yes
+LockPersonality=yes
+PrivateTmp=yes
+# hardening: a curl plus a shell peaks well under 10 MB.
+MemoryMax=64M
 
 [Install]
 WantedBy=multi-user.target

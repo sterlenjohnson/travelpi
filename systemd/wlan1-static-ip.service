@@ -3,12 +3,31 @@ Description=TravelPi AP static IP keeper for the current AP radio
 After=NetworkManager.service
 Before=hostapd.service dnsmasq.service
 ConditionPathExists=/etc/hostapd/hostapd.conf
+# hardening: stop a crash loop after 5 starts in 5 minutes instead of spinning.
+# PartOf=hostapd.service is deliberately NOT added (ADR 0008): the keeper re-reads
+# hostapd.conf every tick, a hostapd stop would also stop the healer, and the
+# watchdog's hostapd restarts would count against this unit's start limit.
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
 ExecStart=/usr/local/libexec/travelpi-ap-ip watch
 Restart=always
 RestartSec=5
+# hardening: reads /etc and /sys, writes nothing on disk (ip addr, sysctl -w
+# under /proc/sys, nmcli over D-Bus), so /usr, /boot and /etc can be read-only.
+# ProtectKernelTunables is NOT set: the link-local toggle writes /proc/sys.
+ProtectSystem=full
+ProtectHome=yes
+# hardening: no /tmp use.
+PrivateTmp=yes
+NoNewPrivileges=yes
+RestrictRealtime=yes
+LockPersonality=yes
+# hardening: NOT set: RestrictAddressFamilies/PrivateNetwork (ip needs
+# AF_NETLINK, nmcli and systemctl need AF_UNIX).
+MemoryMax=64M
 
 [Install]
 WantedBy=multi-user.target

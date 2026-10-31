@@ -4,3 +4,20 @@ Description=TravelPi config backup snapshot
 [Service]
 Type=oneshot
 ExecStart=/usr/local/libexec/travelpi-config-backup
+# hardening: tar of ~tens of MB over live files; a hung read (dying SD card)
+# must not block the timer forever.
+TimeoutStartSec=300
+# hardening: the script writes only under /var/lib/travelpi/backups (staging dir
+# and archive); it reads (never writes) /etc, /opt and /var/lib/tailscale, so /usr,
+# /boot and /etc can be read-only. strict is not used: it would force a
+# ReadWritePaths list that must track the script's TRAVELPI_BACKUP_DIR seam.
+ProtectSystem=full
+# hardening: the backup path list contains nothing under /home.
+ProtectHome=yes
+# hardening: staging uses mktemp inside the backup dir, never /tmp.
+PrivateTmp=yes
+NoNewPrivileges=yes
+RestrictRealtime=yes
+LockPersonality=yes
+# hardening: tar | gzip streaming stays small; 128M leaves room for page cache accounting.
+MemoryMax=128M

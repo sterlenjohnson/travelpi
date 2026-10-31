@@ -9,6 +9,20 @@ RemainAfterExit=yes
 # 700 MHz cap lowers the voltage the rail must feed under sustained load.
 # The dashboard governor control persists to /etc/default/travelpi-power-profile.
 ExecStart=/bin/sh -c 'test -f /etc/default/travelpi-power-profile && . /etc/default/travelpi-power-profile; G=${GOVERNOR:-ondemand}; for d in /sys/devices/system/cpu/cpu*/cpufreq; do echo 700000 > "$d/scaling_max_freq"; echo "$G" > "$d/scaling_governor"; done'
+TimeoutStartSec=30
+# hardening: the script only reads /etc/default/travelpi-power-profile and writes
+# cpufreq sysfs files. /sys is outside ProtectSystem=strict's read-only set, and
+# the explicit ReadWritePaths documents (and pins) the only writable target.
+ProtectSystem=strict
+ReadWritePaths=/sys/devices/system/cpu
+# hardening: no network use at all (echo into sysfs).
+PrivateNetwork=yes
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryMax=64M
 
 [Install]
 WantedBy=multi-user.target
