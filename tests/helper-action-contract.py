@@ -227,11 +227,11 @@ class AuthHost(FakeHost):
 auth_host = AuthHost()
 helper.HOST = auth_host
 try:
-    helper.action('tailscale_auth', {'action': 'tailscale_auth', 'confirm': True, 'authkey': 'tskey-secret123'})
+    helper.action('tailscale_auth', {'action': 'tailscale_auth', 'confirm': True, 'authkey': 'FIXTURE-authkey-123'})
 finally:
     helper.HOST = real_host
 login = [c for c in auth_host.calls if c[:2] == ['/usr/bin/tailscale', 'login']][0]
-assert 'tskey-secret123' not in ' '.join(login) and login[2].startswith('--auth-key=file:'), login
+assert 'FIXTURE-authkey-123' not in ' '.join(login) and login[2].startswith('--auth-key=file:'), login
 
 # set_ap_identity: byte-length SSID and ASCII passphrase
 result = helper.action('set_ap_identity', {'action': 'set_ap_identity', 'confirm': True, 'ssid': '\u00e9' * 20})

@@ -67,7 +67,7 @@ void wrongPayload;
 
 // Payload shapes follow the helper's ACTION_FIELDS and handlers.
 const flip = { action: "wan_flip", confirm: true, wan: "wlan1" } satisfies MutationRequest<"wan_flip">;
-const auth = { action: "tailscale_auth", confirm: true, authkey: "tskey" } satisfies MutationRequest<"tailscale_auth">;
+const auth = { action: "tailscale_auth", confirm: true, authkey: "fixture-authkey" } satisfies MutationRequest<"tailscale_auth">;
 const clone = { action: "apply_mac_clone", confirm: true, mode: "specific", mac: "02:00:00:00:00:01" } satisfies MutationRequest<"apply_mac_clone">;
 void flip;
 void auth;

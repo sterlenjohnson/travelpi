@@ -170,7 +170,7 @@ try:
 
     # --- tailscale_auth: key file is 0600 while it exists, and removed afterwards.
     for login_rc in (0, 1):
-        sentinel = 'tskey-auth-SENTINEL-%d-5d02bb' % login_rc
+        sentinel = 'FIXTURE-AUTHKEY-SENTINEL-%d-5d02bb' % login_rc
         host = RecordingHost(sentinel, login_rc=login_rc)
         responses, out, err = run_action(host, 'tailscale_auth', authkey=sentinel)
         check(len(host.key_files) == 2, 'tailscale login must run once per call (CLI and direct)')
@@ -182,7 +182,7 @@ try:
         check(not leaks(sentinel, *responses, out, err), 'tailscale_auth (rc=%d) leaked the key in a response or stream' % login_rc)
         check(not scan_files(sentinel), 'tailscale_auth left the key in a file: %s' % scan_files(sentinel))
     # a refused key (control characters) must not echo or write anything
-    sentinel = 'tskey bad SENTINEL-space-91ab'
+    sentinel = 'FIXTURE bad SENTINEL-space-91ab'
     host = RecordingHost(sentinel)
     responses, out, err = run_action(host, 'tailscale_auth', authkey=sentinel)
     check(all(r.get('error', {}).get('code') == 'invalid_authkey' for r in responses), 'a malformed key must be refused: %s' % responses)

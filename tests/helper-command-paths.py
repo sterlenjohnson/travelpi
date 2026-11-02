@@ -126,7 +126,7 @@ try:
           f"vpn_toggle failure must be reported: {result}")
 
     # --- tailscale_auth: the authkey must never come back in the response.
-    secret_key = 'tskey-secret-not-for-output'
+    secret_key = 'FIXTURE-authkey-not-for-output'
     host = FakeHost()
     helper.HOST = host
     result = helper.action('tailscale_auth', {'action': 'tailscale_auth', 'confirm': True,
