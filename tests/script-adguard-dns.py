@@ -140,14 +140,14 @@ block = upstream_block(text)
 check(block == ['"[/tailnet-one.ts.net/]100.100.100.100"', '"[/tailnet-two.ts.net/]100.100.100.100"',
                 '"[/home.example/]100.64.0.9"', '192.0.2.1', '192.0.2.2'],
       'upstream_dns must be tailnet splits, home forward, then the DHCP resolvers: %s' % block)
-check('1.1.1.1' not in text and '9.9.9.9' not in text and 'old.example' not in text, 'the previous upstreams must be replaced')
+check('1.1.1.1' not in text and '9.9.9.9' not in text and re.search(r'old\.example', text) is None, 'the previous upstreams must be replaced')
 check(not any(line.startswith('"[/.') or '[/.' in line for line in block), 'a leading-dot split pattern crashes AdGuard and must never be emitted')
 for kept in ('address: 0.0.0.0:80', '  bind_hosts:\n    - 0.0.0.0', '  bootstrap_dns:\n    - 9.9.9.10', 'users: []', '  upstream_dns_file: ""'):
     check(kept in text, 'unrelated yaml must be preserved: %r' % kept)
 check(stat.S_IMODE(cfg.stat().st_mode) == 0o640, 'AdGuardHome.yaml must end mode 0640, got %o' % stat.S_IMODE(cfg.stat().st_mode))
 check(sorted(p.name for p in cfg.parent.iterdir()) == ['AdGuardHome.yaml'], 'no temp files may remain beside the yaml: %s' % list(cfg.parent.iterdir()))
 check('systemctl restart adguardhome.service' in shim_lines(root), 'AdGuard must be restarted to read the new upstreams: %s' % shim_lines(root))
-check(any(l.startswith('logger') and '192.0.2.1' in l and 'tailnet-one.ts.net' in l for l in shim_lines(root)), 'the change must be logged')
+check(any(l.startswith('logger') and '192.0.2.1' in l and re.search(r'tailnet-one\.ts\.net', l) for l in shim_lines(root)), 'the change must be logged')
 if gnu_sed():
     check('127.0.0.1:5335' in text, 'Unbound must be added as fallback_dns')
     check(re.search(r'^  nat64_prefix: "64:ff9b::/96"$', text, re.M), 'the DNS64 prefix must be added once at two-space indent')
