@@ -390,6 +390,39 @@ try:
     check(conf.read_text() == original,
           "hostapd.conf must be back to the previous identity after a failed restart")
 
+    # --- ap_profile: hostapd.conf 0600 + backup removed on success; an exception
+    # after the rewrite restores the previous config.
+    import stat as _stat
+    real_caps = helper.ap_phy_capabilities
+    helper.ap_phy_capabilities = lambda: {'bands': ['2.4ghz', '5ghz'], 'capabilities': ['ap'],
+                                          'supported_channels': {'2.4ghz': [1, 6, 11], '5ghz': [36, 40]}}
+    profile_conf = 'interface=wlan1\nssid=TravelPi\nwpa_passphrase=profile-old-pass\nhw_mode=g\nchannel=6\n'
+    conf.write_text(profile_conf)
+    conf.chmod(0o644)
+    helper.HOSTAPD = conf
+    backup_file = conf.with_suffix('.conf.travelpi-backup')
+    helper.HOST = FakeHost()
+    result = helper.action('set_ap_radio', {'action': 'set_ap_radio', 'confirm': True, 'band': '5ghz'})
+    check(result.get('ok') is True, f"ap_profile must apply: {result}")
+    check(_stat.S_IMODE(conf.stat().st_mode) == 0o600, 'ap_profile must leave hostapd.conf 0600')
+    check(not backup_file.exists(), 'ap_profile must remove the backup after success')
+
+    conf.write_text(profile_conf)
+    conf.chmod(0o644)
+    class RaisingHost(FakeHost):
+        def run(self, argv, **kwargs):
+            if argv[:3] == ['/bin/systemctl', 'restart', 'hostapd'] and not getattr(self, 'raised', False):
+                self.raised = True
+                raise RuntimeError('timeout')
+            return super().run(argv, **kwargs)
+    helper.HOST = RaisingHost()
+    result = helper.action('set_ap_radio', {'action': 'set_ap_radio', 'confirm': True, 'band': '5ghz'})
+    check(result.get('error', {}).get('code') == 'ap_restart_failed', f"an exception after the rewrite must restore: {result}")
+    check(conf.read_text() == profile_conf and _stat.S_IMODE(conf.stat().st_mode) == 0o600,
+          'the restored hostapd.conf must hold the old content at 0600')
+    check(not backup_file.exists(), 'the backup must be removed after a successful restore')
+    helper.ap_phy_capabilities = real_caps
+
     # --- portal cache semantics: the dashboard poll reuses the cache;
     # force=True (the `portal fresh` CLI) must bypass it and re-probe.
     real_portal_cache = helper.PORTAL_CACHE

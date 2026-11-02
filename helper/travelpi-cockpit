@@ -1805,6 +1805,68 @@ def ap_phy_capabilities():
     return radio_phy_capabilities(LAN)
 
 
+def hostapd_backup_path():
+    return HOSTAPD.with_suffix('.conf.travelpi-backup')
+
+
+def write_hostapd_config(content):
+    """hostapd.conf carries the AP WPA passphrase: write it atomically,
+    root-only (0600), regardless of the mode the previous file had."""
+    write_private_file(HOSTAPD, content, 0o600)
+
+
+def backup_hostapd_config():
+    """Snapshot the current hostapd.conf (old passphrase included) at 0600.
+    The copy exists only while a change is in flight."""
+    write_private_file(hostapd_backup_path(), HOSTAPD.read_text(), 0o600)
+
+
+def restore_hostapd_config():
+    """Put the backup back through the private writer so the restored file is
+    0600. Leaves the backup in place; the caller discards it once the whole
+    rollback has succeeded. Raises on failure."""
+    write_hostapd_config(hostapd_backup_path().read_text())
+
+
+def discard_hostapd_backup():
+    """Remove the backup so a previous passphrase does not linger."""
+    try:
+        hostapd_backup_path().unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass  # the change already applied or rolled back; not a failure
+
+
+def apply_hostapd_change(lines):
+    """Write new hostapd.conf lines and restart hostapd, restoring the previous
+    config on any failure after the rewrite. Returns None on success,
+    'failed' (nothing was rewritten), 'restart' (rolled back) or
+    'unrestored' (restore failed; the 0600 backup stays). Never raises."""
+    written = False
+    failed = False
+    try:
+        backup_hostapd_config()
+        write_hostapd_config('\n'.join(lines) + '\n')
+        written = True
+        failed = bool(run(['/bin/systemctl', 'restart', 'hostapd'], timeout=30).returncode)
+    except Exception:
+        failed = True
+    if not failed:
+        discard_hostapd_backup()
+        return None
+    if not written:
+        discard_hostapd_backup()
+        return 'failed'
+    try:
+        restore_hostapd_config()
+        run(['/bin/systemctl', 'restart', 'hostapd'], timeout=30)
+    except Exception:
+        return 'unrestored'
+    discard_hostapd_backup()
+    return 'restart'
+
+
 def ap_profile(request):
     profile = request.get('band')
     if profile not in ('2.4ghz', '5ghz', '6ghz'):
@@ -1849,34 +1911,29 @@ def ap_profile(request):
     # band without ieee80211w=2. Other bands stay at 1 (supported, optional),
     # which is hostapd's default behavior for WPA2-PSK.
     lines = replace_setting(lines, 'ieee80211w', '2' if profile == '6ghz' else '1')
-    backup = HOSTAPD.with_suffix('.conf.travelpi-backup')
-    try:
-        shutil.copy2(HOSTAPD, backup)
-        HOSTAPD.write_text('\n'.join(lines) + '\n')
-        result = run(['/bin/systemctl', 'restart', 'hostapd'], timeout=30)
-    except Exception:
+    outcome = apply_hostapd_change(lines)
+    if outcome == 'failed':
         return fail('ap_update_failed', 'Could not update the AP profile')
-    if result.returncode:
-        restored = True
-        try:
-            shutil.copy2(backup, HOSTAPD)
-            run(['/bin/systemctl', 'restart', 'hostapd'], timeout=30)
-        except Exception:
-            restored = False
-        if not restored:
-            return fail('ap_restart_failed_unrestored',
-                        'AP profile failed to apply and the previous hostapd configuration could not be '
-                        'restored. Repair the radios or restore ' + str(backup) + ' before relying on the AP.')
+    if outcome == 'unrestored':
+        return fail('ap_restart_failed_unrestored',
+                    'AP profile failed to apply and the previous hostapd configuration could not be '
+                    'restored. Repair the radios or restore ' + str(hostapd_backup_path()) + ' before relying on the AP.')
+    if outcome == 'restart':
         return fail('ap_restart_failed', 'AP profile was not verified; the previous profile was restored')
     return ok('set_ap_radio', 'TravelPi AP profile applied')
 
 
 def set_ap_identity(request):
     """Change the AP broadcast name and/or WPA password (WPA2-PSK stays the
-    only mode). The passphrase arrives via stdin JSON (never argv), is
-    written only into hostapd.conf (root 0600), never appears in any
-    response, status payload, or log, and is never stored by the dashboard.
-    Restore-on-fail mirrors ap_profile."""
+    only mode). The passphrase arrives via stdin JSON (never argv) and never
+    appears in any response, status payload, or log. hostapd requires it in
+    its config, so it is written there (and only there) atomically with mode
+    0600, root-only. A 0600 hostapd.conf.travelpi-backup of the previous
+    config (old passphrase) exists only while the change is in flight: it is
+    removed once hostapd restarts. If the restart fails, or anything fails
+    after the rewrite, the previous config is restored at 0600 and the backup
+    removed; if the restore itself fails the 0600 backup is kept and
+    ap_identity_failed_unrestored names it. The dashboard stores nothing."""
     ssid = request.get('ssid')
     passphrase = request.get('passphrase')
     if ssid is None and passphrase is None:
@@ -1905,24 +1962,14 @@ def set_ap_identity(request):
         lines = replace_setting(lines, 'wpa_passphrase', passphrase)
         lines = replace_setting(lines, 'wpa', '2')
         lines = replace_setting(lines, 'wpa_key_mgmt', 'WPA-PSK')
-    backup = HOSTAPD.with_suffix('.conf.travelpi-backup')
-    try:
-        shutil.copy2(HOSTAPD, backup)
-        HOSTAPD.write_text('\n'.join(lines) + '\n')
-        result = run(['/bin/systemctl', 'restart', 'hostapd'], timeout=30)
-    except Exception:
+    outcome = apply_hostapd_change(lines)
+    if outcome == 'failed':
         return fail('ap_identity_failed', 'Could not update the AP identity')
-    if result.returncode:
-        restored = True
-        try:
-            shutil.copy2(backup, HOSTAPD)
-            run(['/bin/systemctl', 'restart', 'hostapd'], timeout=30)
-        except Exception:
-            restored = False
-        if not restored:
-            return fail('ap_identity_failed_unrestored',
-                        'The AP did not come up with the new identity and the previous hostapd configuration '
-                        'could not be restored. Restore ' + str(backup) + ' before relying on the AP.')
+    if outcome == 'unrestored':
+        return fail('ap_identity_failed_unrestored',
+                    'The AP did not come up with the new identity and the previous hostapd configuration '
+                    'could not be restored. Restore ' + str(hostapd_backup_path()) + ' before relying on the AP.')
+    if outcome == 'restart':
         return fail('ap_identity_failed',
                     'The AP did not come up with the new identity; the previous configuration was restored')
     return ok('set_ap_identity', 'AP identity updated')
@@ -2045,51 +2092,65 @@ def apply_radio_layout(ap_iface, wan_iface, ap_hw_mode, ap_channel, ap_ac, ap_ax
     new_lines = replace_setting(new_lines, 'channel', ap_channel)
     new_lines = replace_setting(new_lines, 'ieee80211ac', ap_ac)
     new_lines = replace_setting(new_lines, 'ieee80211ax', ap_ax)
-    backup = HOSTAPD.with_suffix('.conf.travelpi-backup')
+    backup = hostapd_backup_path()
     dnsmasq_backup = dnsmasq_path.with_suffix('.conf.travelpi-backup')
+    written = False
     try:
-        shutil.copy2(HOSTAPD, backup)
+        backup_hostapd_config()
         shutil.copy2(dnsmasq_path, dnsmasq_backup)
-        HOSTAPD.write_text(chr(10).join(new_lines) + chr(10))
+        write_hostapd_config(chr(10).join(new_lines) + chr(10))
+        written = True
         dnsmasq_path.write_text(chr(10).join(dnsmasq_lines) + chr(10))
     except Exception:
+        if written:
+            try:
+                restore_hostapd_config()
+            except Exception:
+                return fail('radio_config_failed',
+                            'Could not rewrite interface configuration and the previous hostapd configuration '
+                            'could not be restored. Restore ' + str(backup) + ' before relying on the AP.')
+        discard_hostapd_backup()
         return fail('radio_config_failed', 'Could not rewrite interface configuration')
 
-    # Tear down any AP and Wi-Fi stations so one radio is never both AP and STA,
-    # and the cloned WAN MAC cannot appear on two interfaces at once.
-    run(['/bin/systemctl', 'stop', 'hostapd'], timeout=20)
-    run(['/bin/systemctl', 'stop', 'dnsmasq'], timeout=20)
-    down_all_wifi_stations()
+    try:
+        # Tear down any AP and Wi-Fi stations so one radio is never both AP and STA,
+        # and the cloned WAN MAC cannot appear on two interfaces at once.
+        run(['/bin/systemctl', 'stop', 'hostapd'], timeout=20)
+        run(['/bin/systemctl', 'stop', 'dnsmasq'], timeout=20)
+        down_all_wifi_stations()
 
-    # Hand the AP radio to hostapd/dnsmasq and assign the AP address.
-    # IPv4-scoped flush: a family-blind flush wipes the IPv6 link-local
-    # address, and radvd must advertise from a link-local source (2026-10-30
-    # ULA incident; see ensure_ipv6_link_local).
-    run(['/usr/bin/nmcli', 'device', 'set', ap_iface, 'managed', 'no'], timeout=20)
-    run(['/sbin/ip', 'link', 'set', ap_iface, 'up'], timeout=20)
-    run(['/sbin/ip', '-4', 'addr', 'flush', 'dev', ap_iface], timeout=20)
-    run(['/sbin/ip', 'addr', 'add', AP_ADDRESS, 'dev', ap_iface], timeout=20)
-    ensure_ipv6_link_local(ap_iface)
-    gateway = ap_v6_gateway()
-    if gateway:
-        run(['/sbin/ip', '-6', 'addr', 'add', gateway, 'dev', ap_iface], timeout=20)
+        # Hand the AP radio to hostapd/dnsmasq and assign the AP address.
+        # IPv4-scoped flush: a family-blind flush wipes the IPv6 link-local
+        # address, and radvd must advertise from a link-local source (2026-10-30
+        # ULA incident; see ensure_ipv6_link_local).
+        run(['/usr/bin/nmcli', 'device', 'set', ap_iface, 'managed', 'no'], timeout=20)
+        run(['/sbin/ip', 'link', 'set', ap_iface, 'up'], timeout=20)
+        run(['/sbin/ip', '-4', 'addr', 'flush', 'dev', ap_iface], timeout=20)
+        run(['/sbin/ip', 'addr', 'add', AP_ADDRESS, 'dev', ap_iface], timeout=20)
+        ensure_ipv6_link_local(ap_iface)
+        gateway = ap_v6_gateway()
+        if gateway:
+            run(['/sbin/ip', '-6', 'addr', 'add', gateway, 'dev', ap_iface], timeout=20)
 
-    # Turn the WAN radio OFF during the transition to avoid a cloned-MAC spoof split.
-    run(['/usr/bin/nmcli', 'device', 'set', wan_iface, 'managed', 'yes'], timeout=20)
-    run(['/sbin/ip', 'link', 'set', wan_iface, 'down'], timeout=20)
+        # Turn the WAN radio OFF during the transition to avoid a cloned-MAC spoof split.
+        run(['/usr/bin/nmcli', 'device', 'set', wan_iface, 'managed', 'yes'], timeout=20)
+        run(['/sbin/ip', 'link', 'set', wan_iface, 'down'], timeout=20)
 
-    run(['/bin/systemctl', 'restart', 'hostapd'], timeout=30)
-    run(['/bin/systemctl', 'restart', 'dnsmasq'], timeout=30)
-    # radvd binds its interface and source address at startup; restart it so
-    # the freshly assigned link-local/gateway addresses take effect.
-    run(['/bin/systemctl', 'restart', 'systemd-networkd'], timeout=20)
-    time.sleep(3)
-    if run(['/bin/systemctl', 'is-active', 'hostapd']).returncode != 0:
+        run(['/bin/systemctl', 'restart', 'hostapd'], timeout=30)
+        run(['/bin/systemctl', 'restart', 'dnsmasq'], timeout=30)
+        # radvd binds its interface and source address at startup; restart it so
+        # the freshly assigned link-local/gateway addresses take effect.
+        run(['/bin/systemctl', 'restart', 'systemd-networkd'], timeout=20)
+        time.sleep(3)
+        failed = run(['/bin/systemctl', 'is-active', 'hostapd']).returncode != 0
+    except Exception:
+        failed = True
+    if failed:
         restored = True
         try:
             # Restore both interface owners: leaving dnsmasq on the new radio
             # while hostapd returns to the old one splits the AP in half.
-            shutil.copy2(backup, HOSTAPD)
+            restore_hostapd_config()
             shutil.copy2(dnsmasq_backup, dnsmasq_path)
             run(['/bin/systemctl', 'restart', 'hostapd'], timeout=30)
             run(['/bin/systemctl', 'restart', 'dnsmasq'], timeout=30)
@@ -2106,7 +2167,9 @@ def apply_radio_layout(ap_iface, wan_iface, ap_hw_mode, ap_channel, ap_ac, ap_ax
                         'The AP did not come up on the new radio and the previous hostapd/dnsmasq configuration '
                         'could not be restored. Repair the radios or restore ' + str(backup) + ' and ' +
                         str(dnsmasq_backup) + ' before relying on the AP.')
+        discard_hostapd_backup()
         return fail('ap_restart_failed', 'The AP did not come up on the new radio; the previous configuration was restored')
+    discard_hostapd_backup()
     return None
 
 

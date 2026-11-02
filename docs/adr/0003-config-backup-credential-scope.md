@@ -28,3 +28,7 @@ Making it world-readable would be a genuine escalation, so the discipline is the
 - `/var/lib/travelpi/backups` is 0755 root; archives are 0600 root. Local pulls are 0600 and contain live credentials: treat `backups/` as secret material and delete it when a Pi is decommissioned.
 - `tests/config-backup.py` enforces the mode discipline and the pull contract (sudo, base64 decode, tar verification) so a future edit cannot silently widen access.
 - Anyone who can read the archive can read hotel PSKs and the tailnet node key. That is accepted for the operator's own administrator account; it is not accepted for any web-facing surface.
+
+## Update: live hostapd.conf and its change-time backup
+
+hostapd requires the AP passphrase in `/etc/hostapd/hostapd.conf`, so the helper writes it there, and only there. The live file is written atomically and is root-only (0600) after every helper change (`set_ap_identity`, `set_ap_radio`, radio layout), regardless of its previous mode. The `hostapd.conf.travelpi-backup` copy of the previous config (which holds the previous passphrase) is also 0600 and exists only during a change: it is removed once hostapd restarts successfully, or once a failed change has been rolled back. If the rollback itself fails, the 0600 backup is kept and the error names it so it can be restored by hand. The daily config backup archive remains the only long-lived copy of the passphrase, root-only 0600 as above.

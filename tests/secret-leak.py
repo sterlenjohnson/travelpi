@@ -9,8 +9,9 @@ authkey, and the WireGuard dump parser / vpn_status / status() fed a dump
 that carries private and preshared key sentinels. The sentinel must never
 reach any recorded argv, captured stdout/stderr, an action response, a status
 payload, a cache file or any other file the helper wrote, and the key file
-must be 0600 and gone after the call. set_ap_identity must keep hostapd.conf's
-mode (and its backup's).
+must be 0600 and gone after the call. set_ap_identity must leave hostapd.conf
+0600 (even when it started 0644), keep its backup 0600 while it exists and
+remove it once the change is applied or rolled back.
 """
 import contextlib
 import importlib.machinery
@@ -65,6 +66,7 @@ class RecordingHost:
         self.argvs = []
         self.stdins = []
         self.key_files = []  # (path, mode, content, existed) observed at login time
+        self.backup_seen = []  # (mode, content) of the hostapd backup at each hostapd restart
 
     def run(self, argv, **kwargs):
         self.argvs.append(list(argv))
@@ -80,6 +82,8 @@ class RecordingHost:
         if argv[:2] == ['/bin/systemctl', 'is-active']:
             return Result(0, 'active\n' if argv[2] in ('wg-quick@wg0', 'travelpi-sqm.service') else 'inactive\n')
         if argv[:2] == ['/bin/systemctl', 'restart'] and argv[2] == 'hostapd':
+            for backup in helper.HOSTAPD.parent.glob('*.travelpi-backup'):
+                self.backup_seen.append((stat.S_IMODE(backup.stat().st_mode), backup.read_text()))
             return Result(self.restart_rc)
         if argv[:5] == ['/usr/bin/nmcli', '-t', '-f', 'NAME,DEVICE', 'connection']:
             return Result(0, 'HotelWiFi:wlan0\n')
@@ -142,31 +146,59 @@ try:
         check(not leaks(sentinel, *responses, out, err), 'connect_hotel (rc=%d) leaked the password in a response or stream' % rc)
         check(not scan_files(sentinel), 'connect_hotel (rc=%d) wrote the password to a file: %s' % (rc, scan_files(sentinel)))
 
-    # --- set_ap_identity: success and a failed restart; hostapd.conf mode is kept.
+    # --- set_ap_identity: success and a failed restart. hostapd.conf ends 0600 even
+    # when it started 0644; the backup is 0600 while it exists and gone afterwards.
+    OLD_CONF = 'interface=wlan1\nssid=TravelPi\nwpa=2\nwpa_key_mgmt=WPA-PSK\nwpa_passphrase=old-pass-1234\n'
     for restart_rc in (0, 1):
         sentinel = 'SENTINEL-AP-PASS-%d-c41e88' % restart_rc
         conf = helper.HOSTAPD
-        conf.write_text('interface=wlan1\nssid=TravelPi\nwpa=2\nwpa_key_mgmt=WPA-PSK\nwpa_passphrase=old-pass-1234\n')
-        conf.chmod(0o640)
+        conf.write_text(OLD_CONF)
+        conf.chmod(0o644)
         for stale in sandbox.glob('*.travelpi-backup'):
             stale.unlink()
-        mode_before = stat.S_IMODE(conf.stat().st_mode)
         host = RecordingHost(sentinel, restart_rc=restart_rc)
         responses, out, err = run_action(host, 'set_ap_identity', ssid='Camp Van', passphrase=sentinel)
         check(not leaks(sentinel, *host.argvs), 'set_ap_identity (restart rc=%d) put the passphrase in argv' % restart_rc)
         check(not host.stdins, 'set_ap_identity must not feed the passphrase to any command')
         check(not leaks(sentinel, *responses, out, err), 'set_ap_identity (restart rc=%d) leaked the passphrase in a response or stream' % restart_rc)
-        check(stat.S_IMODE(conf.stat().st_mode) == mode_before,
-              'set_ap_identity must keep hostapd.conf mode %o, got %o' % (mode_before, stat.S_IMODE(conf.stat().st_mode)))
-        for backup in sandbox.glob('*.travelpi-backup'):
-            check(stat.S_IMODE(backup.stat().st_mode) == mode_before,
-                  'the hostapd backup must not be more readable than hostapd.conf: %o' % stat.S_IMODE(backup.stat().st_mode))
-        check(sentinel in conf.read_text() if restart_rc == 0 else sentinel not in conf.read_text(),
-              'the passphrase must be in hostapd.conf only when the change was applied (restart rc=%d)' % restart_rc)
-        # The restore backup is a copy of hostapd.conf (same mode, checked above); the
-        # second (direct) call in run_action backs up the config the first call wrote.
-        allowed = (conf,) + tuple(sandbox.glob('*.travelpi-backup'))
-        check(not scan_files(sentinel, allowed=allowed), 'set_ap_identity wrote the passphrase outside hostapd.conf: %s' % scan_files(sentinel, allowed))
+        check(stat.S_IMODE(conf.stat().st_mode) == 0o600,
+              'set_ap_identity (rc=%d) must leave hostapd.conf 0600, got %o' % (restart_rc, stat.S_IMODE(conf.stat().st_mode)))
+        check(host.backup_seen and all(mode == 0o600 for mode, _ in host.backup_seen),
+              'the hostapd backup must be 0600 while it exists: %s' % [oct(m) for m, _ in host.backup_seen])
+        check(not list(sandbox.glob('*.travelpi-backup')),
+              'the hostapd backup (old passphrase) must be gone after the call (rc=%d): %s' % (restart_rc, list(sandbox.glob('*.travelpi-backup'))))
+        if restart_rc == 0:
+            check(sentinel in conf.read_text(), 'the new passphrase must be in hostapd.conf after success')
+            check('old-pass-1234' not in conf.read_text(), 'the previous passphrase must not linger in hostapd.conf')
+        else:
+            check(sentinel not in conf.read_text(), 'a failed restart must not leave the new passphrase in hostapd.conf')
+            check(conf.read_text() == OLD_CONF, 'a failed restart must restore the OLD content: %r' % conf.read_text())
+            check(any('old-pass-1234' in c for _, c in host.backup_seen), 'positive control: the backup held the old config')
+        check(not scan_files(sentinel, allowed=(conf,)), 'set_ap_identity wrote the passphrase outside hostapd.conf: %s' % scan_files(sentinel, (conf,)))
+
+    # --- a restore that itself fails keeps the 0600 backup and says so.
+    sentinel = 'SENTINEL-AP-PASS-unrestored-9d2f10'
+    conf = helper.HOSTAPD
+    conf.write_text(OLD_CONF)
+    conf.chmod(0o644)
+    host = RecordingHost(sentinel, restart_rc=1)
+    real_restore = helper.restore_hostapd_config
+
+    def broken_restore():
+        raise OSError('disk gone')
+    helper.restore_hostapd_config = broken_restore
+    try:
+        helper.HOST = host
+        result = helper.action('set_ap_identity', {'action': 'set_ap_identity', 'confirm': True, 'passphrase': sentinel})
+    finally:
+        helper.restore_hostapd_config = real_restore
+    check(result.get('error', {}).get('code') == 'ap_identity_failed_unrestored', 'a failed restore must be *_unrestored: %s' % result)
+    backups = list(sandbox.glob('*.travelpi-backup'))
+    check(len(backups) == 1 and stat.S_IMODE(backups[0].stat().st_mode) == 0o600 and backups[0].read_text() == OLD_CONF,
+          'an unrestored failure must keep the 0600 backup of the old config: %s' % backups)
+    check(not leaks(sentinel, result), 'the unrestored response must not echo the passphrase')
+    for stale in backups:
+        stale.unlink()
 
     # --- tailscale_auth: key file is 0600 while it exists, and removed afterwards.
     for login_rc in (0, 1):

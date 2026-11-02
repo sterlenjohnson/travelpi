@@ -14,6 +14,8 @@ so the layout path can be driven; it does not make the swap reachable.
 import importlib.machinery
 import importlib.util
 import json
+import os
+import stat
 import sys
 import tempfile
 import time
@@ -225,6 +227,40 @@ try:
     check(str(lost) in result['error']['message'] and 'restored' not in result['error']['message'].replace('could not be restored', ''),
           'the unrestored message must name the backup and not claim a restore: %s' % result)
     check(host.mutated_nm() == [], 'an unrestored failure must not touch NM connections')
+
+    # --- hostapd.conf carries the AP passphrase: 0600 and the backup gone after success.
+    reset_files()
+    hostapd_conf.chmod(0o644)
+    host = RadioHost(hostapd_conf, dnsmasq_conf)
+    result = act('wan_flip', host)
+    check(result.get('ok') is True, 'layout must succeed for the mode check: %s' % result)
+    check(stat.S_IMODE(hostapd_conf.stat().st_mode) == 0o600, 'hostapd.conf must be 0600 after the layout, got %o' % stat.S_IMODE(hostapd_conf.stat().st_mode))
+    check(not hostapd_conf.with_suffix('.conf.travelpi-backup').exists(), 'the hostapd backup must be removed after success')
+
+    # --- rollback restores hostapd.conf at 0600 and removes the backup.
+    reset_files()
+    hostapd_conf.chmod(0o644)
+    host = RadioHost(hostapd_conf, dnsmasq_conf, hostapd_active=False)
+    result = act('wan_flip', host)
+    check(result.get('error', {}).get('code') == 'ap_restart_failed', 'rollback expected: %s' % result)
+    check(hostapd_conf.read_text() == HOSTAPD_TEXT and stat.S_IMODE(hostapd_conf.stat().st_mode) == 0o600,
+          'a restored hostapd.conf must be 0600')
+    check(not hostapd_conf.with_suffix('.conf.travelpi-backup').exists(), 'the hostapd backup must be removed after a restore')
+
+    # --- an exception after the rewrite restores both configs instead of failing in place.
+    reset_files()
+    host = RadioHost(hostapd_conf, dnsmasq_conf)
+    real_run = host.run
+
+    def boom(argv, **kwargs):
+        if argv[:3] == ['/bin/systemctl', 'stop', 'hostapd']:
+            raise RuntimeError('host exploded')
+        return real_run(argv, **kwargs)
+    host.run = boom
+    result = act('wan_flip', host)
+    check(result.get('error', {}).get('code') == 'ap_restart_failed', 'an exception after the rewrite must roll back: %s' % result)
+    check(hostapd_conf.read_text() == HOSTAPD_TEXT and dnsmasq_conf.read_text() == DNSMASQ_TEXT,
+          'an exception after the rewrite must restore both configs')
 
     # --- one radio: refused before any mutation.
     reset_files()
